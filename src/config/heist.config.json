@@ -2,10 +2,12 @@
   "backend": "memory",
   "currency": "HD",
   "welcomeGrant": "500",
+  "services": {
+    "hospital_full_heal": { "entity": "hospital", "price": "200" },
+    "gas_per_liter": { "entity": "gas-station-1", "price": "2" }
+  },
   "prices": {
-    "bike_rental": "10",
-    "hospital_full_heal": "200",
-    "gas_per_liter": "2"
+    "bike_rental": "10"
   },
   "rentalPerMinute": {
     "bike": "1",

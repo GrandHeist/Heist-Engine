@@ -27,7 +27,7 @@ import {
   UnknownEntity,
   UnknownWallet,
 } from '../errors.ts';
-import { parseAmount, priceOf, rentalRateOf, TREASURY_ID } from '../config/config.ts';
+import { parseAmount, priceOf, rentalRateOf, serviceOf, TREASURY_ID } from '../config/config.ts';
 import type { HeistConfig } from '../config/config.ts';
 import type { LedgerBackend, WalletKeyInfo } from '../ledger/backend.ts';
 import type { Custody } from './custody.ts';
@@ -256,12 +256,10 @@ export class EconomyEngine {
     const units = intent.units === undefined ? 1 : requireWholeCount(intent.units, 'units');
 
     // Unknown service is reported as UnknownEntity per the intent catalog: there
-    // is no entity behind it to pay.
-    if (this.#config.prices[intent.service] === undefined) {
-      throw new UnknownEntity(intent.service);
-    }
-    const entityId = this.#resolveServiceEntity(intent.service);
-    const amount = priceOf(this.#config, intent.service) * BigInt(units);
+    // is no entity behind it to pay. `serviceOf` throws exactly that.
+    const service = serviceOf(this.#config, intent.service);
+    const entityId: OwnerId = service.entity;
+    const amount = service.price * BigInt(units);
     requirePositive(amount, 'price');
 
     const player = await this.#requireWallet(intent.actor);
@@ -453,30 +451,6 @@ export class EconomyEngine {
       cursor = result.cursor;
     }
     return null;
-  }
-
-  /**
-   * Map a price key to the entity that collects it. There is no explicit
-   * service -> entity table in the config, so the mapping is by convention, in
-   * order: exact entity id, then the leading token of the key, then the first
-   * entity whose id starts with that token. e.g. hospital_full_heal -> hospital,
-   * gas_per_liter -> gas-station-1, bike_rental -> bike-rental-co.
-   */
-  #resolveServiceEntity(service: string): OwnerId {
-    if (this.#entities.has(service)) return service;
-
-    const dashed = service.replace(/_/g, '-');
-    if (this.#entities.has(dashed)) return dashed;
-
-    const head = dashed.split('-')[0];
-    if (head !== undefined && head !== '') {
-      if (this.#entities.has(head)) return head;
-      const prefix = `${head}-`;
-      for (const id of this.#entities.keys()) {
-        if (id.startsWith(prefix)) return id;
-      }
-    }
-    throw new UnknownEntity(service);
   }
 
   // -------------------------------------------------------------------------

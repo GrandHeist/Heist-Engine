@@ -12,7 +12,7 @@
 
 import { readFileSync } from 'node:fs';
 import { isAbsolute, resolve } from 'node:path';
-import { EngineError, InvalidIntent } from '../errors.ts';
+import { EngineError, InvalidIntent, UnknownEntity } from '../errors.ts';
 import type { BackendName } from '../ledger/backend.ts';
 
 /** An NPC/system account. `treasury` is mandatory — it is the mint source. */
@@ -22,13 +22,31 @@ export interface EntityConfig {
   name?: string;
 }
 
+/** A purchasable service: who collects the money, and how much. */
+export interface ServiceConfig {
+  /** Entity id that receives the payment. MUST match a configured entity. */
+  entity: string;
+  /** Price per unit. Decimal string. */
+  price: string;
+}
+
 export interface HeistConfig {
   backend: BackendName;
   /** Currency ticker. Cosmetic — the ledger is single-currency by design. */
   currency: string;
   /** Minted from treasury to a new player on OpenAccount. Decimal string. */
   welcomeGrant: string;
-  /** service key -> price, decimal strings. e.g. { hospital_full_heal: "200" } */
+  /**
+   * BuyService catalog: service name -> { payee entity, price }. This is the
+   * ONLY source of truth for BuyService. The payee is explicit precisely so a
+   * new service can never be silently routed to the wrong entity by a name
+   * heuristic — an unknown entity here is a load-time failure.
+   */
+  services: Record<string, ServiceConfig>;
+  /**
+   * Non-service costs keyed by name, decimal strings. e.g. the `bike_rental`
+   * flat fee used when a vehicle has no per-minute rate. NOT used by BuyService.
+   */
   prices: Record<string, string>;
   /** vehicle key -> per-minute rental rate, decimal strings. */
   rentalPerMinute: Record<string, string>;
@@ -84,7 +102,25 @@ export function parseAmount(value: string, field: string): bigint {
   return BigInt(whole);
 }
 
-/** Price of a catalog service as bigint. Throws InvalidIntent for unknown keys. */
+/**
+ * The payee entity and price of a catalog service.
+ *
+ * Throws `UnknownEntity` for a service that is not in the catalog — from the
+ * caller's point of view there is simply no entity behind that name to pay.
+ * The entity itself is guaranteed to exist by load-time validation.
+ */
+export function serviceOf(
+  config: HeistConfig,
+  name: string,
+): { entity: string; price: bigint } {
+  const entry = config.services[name];
+  if (entry === undefined) {
+    throw new UnknownEntity(name);
+  }
+  return { entity: entry.entity, price: parseAmount(entry.price, `services.${name}.price`) };
+}
+
+/** Price of a non-service cost as bigint. Throws InvalidIntent for unknown keys. */
 export function priceOf(config: HeistConfig, service: string): bigint {
   const raw = config.prices[service];
   if (raw === undefined) {
@@ -116,10 +152,12 @@ export function defaultConfig(): HeistConfig {
     backend: 'memory',
     currency: 'HD',
     welcomeGrant: '500',
+    services: {
+      hospital_full_heal: { entity: 'hospital', price: '200' },
+      gas_per_liter: { entity: 'gas-station-1', price: '2' },
+    },
     prices: {
       bike_rental: '10',
-      hospital_full_heal: '200',
-      gas_per_liter: '2',
     },
     rentalPerMinute: {
       bike: '1',
@@ -228,12 +266,24 @@ export function validateConfig(input: unknown, source = '<inline>'): HeistConfig
   );
 
   // entities ---------------------------------------------------------------
+  // Read before services: the service catalog is checked against these ids, and
+  // a service pointing at a non-existent entity must fail here, at startup,
+  // rather than pay the wrong entity at runtime.
   const entities = readEntities(input['entities'] ?? defaults.entities, source);
+
+  // services ---------------------------------------------------------------
+  const services = readServices(
+    input['services'],
+    defaults.services,
+    new Set(entities.map((e) => e.id)),
+    source,
+  );
 
   const config: HeistConfig = {
     backend,
     currency,
     welcomeGrant,
+    services,
     prices,
     rentalPerMinute,
     entities,
@@ -282,6 +332,65 @@ function readAmountMap(
     }
     parseAmount(value, `${field}.${key}`);
     out[key] = value.trim();
+  }
+  return out;
+}
+
+/**
+ * Read the BuyService catalog, checking every payee against the configured
+ * entity ids. An unknown entity throws immediately and names the service, so a
+ * typo is a startup failure instead of a silent mispayment.
+ */
+function readServices(
+  raw: unknown,
+  fallback: Record<string, ServiceConfig>,
+  entityIds: ReadonlySet<string>,
+  source: string,
+): Record<string, ServiceConfig> {
+  const input = raw === undefined || raw === null ? fallback : raw;
+  if (!isRecord(input)) {
+    throw new InvalidIntent(
+      `config (${source}): services must be an object of name -> { entity, price }, got ${describe(raw)}`,
+    );
+  }
+
+  const out: Record<string, ServiceConfig> = {};
+  for (const [key, value] of Object.entries(input)) {
+    if (key.trim() === '') {
+      throw new InvalidIntent(`config (${source}): services has an empty key`);
+    }
+    if (!isRecord(value)) {
+      throw new InvalidIntent(
+        `config (${source}): services.${key} must be an object like ` +
+          `{ "entity": "hospital", "price": "200" }, got ${describe(value)}`,
+      );
+    }
+
+    const entity = value['entity'];
+    if (typeof entity !== 'string' || entity.trim() === '') {
+      throw new InvalidIntent(
+        `config (${source}): services.${key}.entity must be a non-empty string, got ${describe(entity)}`,
+      );
+    }
+    const entityId = entity.trim();
+    if (!entityIds.has(entityId)) {
+      throw new InvalidIntent(
+        `config (${source}): services.${key}.entity = ${JSON.stringify(entityId)} is not a ` +
+          `configured entity id. Add it to "entities" or point the service at one of: ` +
+          `${[...entityIds].join(', ')}`,
+      );
+    }
+
+    const price = value['price'];
+    if (typeof price !== 'string') {
+      throw new InvalidIntent(
+        `config (${source}): services.${key}.price must be a decimal string, got ${describe(price)}. ` +
+          `Quote money values — JSON numbers are floats.`,
+      );
+    }
+    parseAmount(price, `services.${key}.price`);
+
+    out[key] = { entity: entityId, price: price.trim() };
   }
   return out;
 }
