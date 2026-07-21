@@ -1,0 +1,25 @@
+{
+  "name": "heist-engine",
+  "version": "0.1.0",
+  "description": "Drop-in economy engine for GTA RP servers with a swappable ledger backend. Currency: HD (Heist Dollars).",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "test": "node --test tests/",
+    "typecheck": "tsc --noEmit",
+    "sim": "node src/cli/sim.ts",
+    "check": "npm run typecheck && npm test"
+  },
+  "keywords": ["gta", "fivem", "ragemp", "roleplay", "economy", "ledger"],
+  "license": "MIT",
+  "dependencies": {},
+  "optionalDependencies": {
+    "pg": "^8.13.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "@types/node": "^22.10.0"
+  }
+}
