@@ -10,6 +10,21 @@ export interface CreateWalletOptions {
   isEntity?: boolean;
 }
 
+/**
+ * The public half of a wallet's keypair, minted by Custody and handed to the backend.
+ *
+ * Backends MUST NOT generate, derive, or store private key material. They receive the
+ * public half only. Custody owns the secret half; the ledger stores what is safe to
+ * publish. Any backend that generates its own keypair produces a pubkey nothing can
+ * sign for, so signatures would never verify against the chain.
+ */
+export interface WalletKeyInfo {
+  /** ed25519 public key, hex. */
+  pubkey: string;
+  /** Display address derived from the pubkey. */
+  address: string;
+}
+
 export interface HistoryPage {
   txs: Tx[];
   /** Opaque cursor for the next page, or null when the end is reached. */
@@ -32,7 +47,11 @@ export interface LedgerBackend {
   init(): Promise<void>;
   close(): Promise<void>;
 
-  createWallet(ownerId: OwnerId, opts?: CreateWalletOptions): Promise<Wallet>;
+  /**
+   * Persist a wallet for `ownerId` using a keypair minted by Custody.
+   * Idempotent per owner: calling twice returns the existing wallet rather than throwing.
+   */
+  createWallet(ownerId: OwnerId, key: WalletKeyInfo, opts?: CreateWalletOptions): Promise<Wallet>;
   getWallet(id: WalletId): Promise<Wallet | null>;
   getWalletByOwner(ownerId: OwnerId): Promise<Wallet | null>;
   listWallets(): Promise<Wallet[]>;

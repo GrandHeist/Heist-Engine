@@ -1,0 +1,23 @@
+{
+  "backend": "memory",
+  "currency": "HD",
+  "welcomeGrant": "500",
+  "prices": {
+    "bike_rental": "10",
+    "hospital_full_heal": "200",
+    "gas_per_liter": "2"
+  },
+  "rentalPerMinute": {
+    "bike": "1",
+    "car": "3",
+    "helicopter": "25"
+  },
+  "entities": [
+    { "id": "treasury", "name": "City Treasury" },
+    { "id": "bike-rental-co", "name": "Crystal Bikes" },
+    { "id": "hospital", "name": "Pillbox Medical" },
+    { "id": "gas-station-1", "name": "Xero Gas — Strawberry" },
+    { "id": "taxi-co", "name": "Downtown Cab Co." },
+    { "id": "pd-payroll", "name": "LSPD Payroll" }
+  ]
+}
