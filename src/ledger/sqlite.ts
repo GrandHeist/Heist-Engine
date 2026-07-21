@@ -224,6 +224,17 @@ export class SqliteBackend implements LedgerBackend {
   ): Promise<Wallet> {
     const db = this.database();
     if (ownerId.length === 0) throw new InvalidIntent('ownerId must not be empty');
+    // A wallet with no pubkey/address is one nothing can ever sign for — see the WalletKeyInfo
+    // doc comment in backend.ts. Reject before anything is persisted.
+    if (key === null || typeof key !== 'object') {
+      throw new InvalidIntent('key must be a WalletKeyInfo');
+    }
+    if (typeof key.pubkey !== 'string' || key.pubkey.length === 0) {
+      throw new InvalidIntent('key.pubkey must be a non-empty string');
+    }
+    if (typeof key.address !== 'string' || key.address.length === 0) {
+      throw new InvalidIntent('key.address must be a non-empty string');
+    }
 
     const existing = await this.getWalletByOwner(ownerId);
     if (existing !== null) return existing;
@@ -315,6 +326,12 @@ export class SqliteBackend implements LedgerBackend {
     if (amount <= 0n) {
       throw new InvalidAmount(`Amount must be positive, got ${amount} HD`);
     }
+    // An empty nonce is not a nonce: stored, it would occupy the nonces PRIMARY KEY once and
+    // make every later empty-nonce write collide as a duplicate. Reject it outright, outside
+    // the transaction, so no rollback is involved.
+    if (memo.nonce !== undefined && memo.nonce.length === 0) {
+      throw new InvalidIntent('memo.nonce must not be empty');
+    }
 
     db.exec('BEGIN IMMEDIATE');
     try {
@@ -395,6 +412,9 @@ export class SqliteBackend implements LedgerBackend {
 
   async history(id: WalletId, cursor?: string, limit = DEFAULT_LIMIT): Promise<HistoryPage> {
     const db = this.database();
+    // An unknown wallet is an error, not an empty page — otherwise a caller cannot tell
+    // "no history" from "no such wallet". Matches getBalance and MemoryBackend.
+    this.assertWalletExists(id);
     if (!Number.isSafeInteger(limit) || limit <= 0) {
       throw new InvalidIntent(`History limit must be a positive integer, got ${limit}`);
     }

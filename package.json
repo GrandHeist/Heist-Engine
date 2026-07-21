@@ -7,7 +7,7 @@
     "node": ">=24"
   },
   "scripts": {
-    "test": "node --test tests/",
+    "test": "node --test 'tests/**/*.test.ts'",
     "typecheck": "tsc --noEmit",
     "sim": "node src/cli/sim.ts",
     "check": "npm run typecheck && npm test"
