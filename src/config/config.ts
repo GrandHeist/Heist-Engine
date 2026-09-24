@@ -51,6 +51,12 @@ export interface HeistConfig {
   /** vehicle key -> per-minute rental rate, decimal strings. */
   rentalPerMinute: Record<string, string>;
   entities: EntityConfig[];
+  /**
+   * Owner ids of staff who may authorize privileged intents (currently: Theft, alongside
+   * the victim's own consent). Never an entity id. The engine checks the claimed id against
+   * this list; that the claim is genuine is the adapter-auth layer's job (docs/adr/0004).
+   */
+  admins: string[];
   /** Filesystem path for the sqlite backend. Ignored by other backends. */
   dbPath?: string;
 }
@@ -172,6 +178,7 @@ export function defaultConfig(): HeistConfig {
       { id: 'taxi-co', name: 'Downtown Cab Co.' },
       { id: 'pd-payroll', name: 'LSPD Payroll' },
     ],
+    admins: [],
   };
 }
 
@@ -279,6 +286,8 @@ export function validateConfig(input: unknown, source = '<inline>'): HeistConfig
     source,
   );
 
+  const admins = readAdmins(input['admins'], defaults.admins, entities, source);
+
   const config: HeistConfig = {
     backend,
     currency,
@@ -287,6 +296,7 @@ export function validateConfig(input: unknown, source = '<inline>'): HeistConfig
     prices,
     rentalPerMinute,
     entities,
+    admins,
   };
 
   // dbPath — optional, and under exactOptionalPropertyTypes it must be omitted
@@ -391,6 +401,34 @@ function readServices(
     parseAmount(price, `services.${key}.price`);
 
     out[key] = { entity: entityId, price: price.trim() };
+  }
+  return out;
+}
+
+function readAdmins(
+  raw: unknown,
+  fallback: string[],
+  entities: EntityConfig[],
+  source: string,
+): string[] {
+  if (raw === undefined || raw === null) return [...fallback];
+  if (!Array.isArray(raw)) {
+    throw new InvalidIntent(`config (${source}): admins must be an array of owner ids, got ${describe(raw)}`);
+  }
+  const reserved = new Set(entities.map((e) => e.id.toLowerCase()));
+  const out: string[] = [];
+  for (const item of raw as unknown[]) {
+    if (typeof item !== 'string' || item.trim() === '') {
+      throw new InvalidIntent(`config (${source}): admins entries must be non-empty strings, got ${describe(item)}`);
+    }
+    const id = item.trim();
+    if (reserved.has(id.toLowerCase())) {
+      throw new InvalidIntent(`config (${source}): admin "${id}" collides with an entity id`);
+    }
+    if (out.includes(id)) {
+      throw new InvalidIntent(`config (${source}): duplicate admin "${id}"`);
+    }
+    out.push(id);
   }
   return out;
 }

@@ -21,5 +21,6 @@
     { "id": "gas-station-1", "name": "Xero Gas — Strawberry" },
     { "id": "taxi-co", "name": "Downtown Cab Co." },
     { "id": "pd-payroll", "name": "LSPD Payroll" }
-  ]
+  ],
+  "admins": []
 }

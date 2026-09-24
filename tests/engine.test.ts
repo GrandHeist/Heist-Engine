@@ -13,6 +13,11 @@ import type { EngineResponse, Intent, IntentFailure, IntentResult } from '../src
 
 const RENTAL_ENTITY = 'bike-rental-co';
 const WELCOME_GRANT = 500n;
+const ADMIN = 'admin-42';
+
+function testConfig() {
+  return { ...defaultConfig(), admins: [ADMIN] };
+}
 
 let backend: MemoryBackend;
 let custody: Custody;
@@ -62,7 +67,7 @@ async function openAccount(actor: string): Promise<IntentResult> {
 beforeEach(async () => {
   backend = new MemoryBackend();
   custody = new Custody('memory');
-  engine = new EconomyEngine({ backend, custody, config: defaultConfig() });
+  engine = new EconomyEngine({ backend, custody, config: testConfig() });
   await engine.init();
 });
 
@@ -280,7 +285,7 @@ describe('EconomyEngine — happy paths for all 8 intents', () => {
         actor: 'robber',
         victim: 'victim',
         amount: '90',
-        authorizedBy: 'admin-42',
+        authorizedBy: ADMIN,
       }),
     );
 
@@ -288,7 +293,7 @@ describe('EconomyEngine — happy paths for all 8 intents', () => {
     assert.equal(await balanceOf('victim'), WELCOME_GRANT - 90n);
 
     const tx = await backend.getTx(result.txId);
-    assert.ok(tx?.memo.detail?.includes('admin-42'));
+    assert.ok(tx?.memo.detail?.includes(ADMIN));
   });
 
   test('the whole run leaves the ledger verifiably intact', async () => {
@@ -343,6 +348,224 @@ describe('EconomyEngine — concurrency', () => {
 
     assert.equal(returns.filter((r) => r.ok).length, 1, 'exactly one refund may settle');
     assert.equal(await balanceOf('player-1'), WELCOME_GRANT, 'rented 10, refunded 10, once');
+  });
+});
+
+/** Sum of every wallet balance: the money supply. Only mints and burns may change it. */
+async function totalSupply(): Promise<bigint> {
+  let total = 0n;
+  for (const wallet of await backend.listWallets()) total += await backend.getBalance(wallet.id);
+  return total;
+}
+
+describe('EconomyEngine — OpenAccount grants once per owner', () => {
+  test('repeating OpenAccount with fresh nonces does not mint again', async () => {
+    const first = await openAccount('player-1');
+    assert.equal(first.newBalance, WELCOME_GRANT);
+
+    for (let i = 0; i < 3; i++) {
+      const again = await engine.submit({ type: 'OpenAccount', nonce: nonce('open'), actor: 'player-1' });
+      const failure = expectFail(again, 'ACCOUNT_EXISTS');
+      assert.ok(failure.message.includes('player-1'));
+    }
+
+    assert.equal(await balanceOf('player-1'), WELCOME_GRANT);
+    assert.equal(await totalSupply(), WELCOME_GRANT, 'no extra HD may have been minted');
+    const wallet = await backend.getWalletByOwner('player-1');
+    assert.ok(wallet !== null);
+    assert.equal((await backend.history(wallet.id)).txs.length, 1, 'exactly one grant on the ledger');
+  });
+
+  test('concurrent OpenAccount calls for one new owner grant exactly once', async () => {
+    const results = await Promise.all(
+      Array.from({ length: 8 }, () =>
+        engine.submit({ type: 'OpenAccount', nonce: nonce('open'), actor: 'racer' }),
+      ),
+    );
+
+    assert.equal(results.filter((r) => r.ok).length, 1, 'exactly one call may win');
+    for (const r of results.filter((r) => !r.ok)) assert.equal(r.code, 'ACCOUNT_EXISTS');
+    assert.equal(await balanceOf('racer'), WELCOME_GRANT);
+    assert.equal(await totalSupply(), WELCOME_GRANT);
+    assert.equal((await backend.listWallets()).filter((w) => w.ownerId === 'racer').length, 1);
+  });
+
+  test('an interrupted open (wallet written, no grant) is completed, once', async () => {
+    const key = custody.createKeypair('half-open');
+    await backend.createWallet('half-open', { pubkey: key.pubkey, address: key.address });
+
+    const done = expectOk(
+      await engine.submit({ type: 'OpenAccount', nonce: nonce('open'), actor: 'half-open' }),
+    );
+    assert.equal(done.newBalance, WELCOME_GRANT);
+    expectFail(
+      await engine.submit({ type: 'OpenAccount', nonce: nonce('open'), actor: 'half-open' }),
+      'ACCOUNT_EXISTS',
+    );
+    assert.equal(await balanceOf('half-open'), WELCOME_GRANT);
+  });
+});
+
+describe('EconomyEngine — entity ids are not players', () => {
+  const ENTITY_IDS = defaultConfig().entities.map((e) => e.id);
+
+  /** Every player-intent shape, parameterised by the id put in the position under test. */
+  function intentsWithActor(id: string): Intent[] {
+    return [
+      { type: 'OpenAccount', nonce: nonce('e'), actor: id },
+      { type: 'RentVehicle', nonce: nonce('e'), actor: id, vehicle: 'bike', minutes: 5 },
+      { type: 'ReturnVehicle', nonce: nonce('e'), actor: id, vehicle: 'bike', minutesUnused: 5 },
+      { type: 'BuyService', nonce: nonce('e'), actor: id, service: 'hospital_full_heal' },
+      { type: 'Payout', nonce: nonce('e'), actor: id, employer: 'pd-payroll', amount: '50' },
+      { type: 'Fine', nonce: nonce('e'), actor: id, amount: '50' },
+      { type: 'Transfer', nonce: nonce('e'), actor: id, to: 'player-1', amount: '50' },
+      { type: 'Theft', nonce: nonce('e'), actor: id, victim: 'player-1', amount: '50', authorizedBy: ADMIN },
+    ];
+  }
+
+  test('no entity id may be the actor of any player intent, and no HD moves', async () => {
+    await openAccount('player-1');
+    for (const id of ENTITY_IDS) await engine.fundEntity(id, '1000', nonce('fund'));
+    const supply = await totalSupply();
+    const before = new Map<string, bigint>();
+    for (const w of await backend.listWallets()) before.set(w.id, await backend.getBalance(w.id));
+
+    for (const id of ENTITY_IDS) {
+      for (const intent of intentsWithActor(id)) {
+        expectFail(await engine.submit(intent), 'NOT_AUTHORIZED');
+      }
+    }
+
+    assert.equal(await totalSupply(), supply);
+    for (const w of await backend.listWallets()) {
+      assert.equal(await backend.getBalance(w.id), before.get(w.id), `${w.ownerId} balance moved`);
+    }
+  });
+
+  test('no entity id may be the recipient of a Transfer or the victim of a Theft', async () => {
+    await openAccount('player-1');
+    for (const id of ENTITY_IDS) {
+      await engine.fundEntity(id, '1000', nonce('fund'));
+      expectFail(
+        await engine.submit({ type: 'Transfer', nonce: nonce('e'), actor: 'player-1', to: id, amount: '10' }),
+        'NOT_AUTHORIZED',
+      );
+      expectFail(
+        await engine.submit({
+          type: 'Theft',
+          nonce: nonce('e'),
+          actor: 'player-1',
+          victim: id,
+          amount: '10',
+          authorizedBy: ADMIN,
+        }),
+        'NOT_AUTHORIZED',
+      );
+      assert.equal(await balanceOf(id), 1000n, `${id} must not have been drained or credited`);
+    }
+    assert.equal(await balanceOf('player-1'), WELCOME_GRANT);
+  });
+
+  test('a different casing of an entity id is reserved too', async () => {
+    for (const id of ['Treasury', 'TREASURY', 'Bike-Rental-Co']) {
+      expectFail(await engine.submit({ type: 'OpenAccount', nonce: nonce('e'), actor: id }), 'NOT_AUTHORIZED');
+    }
+    assert.equal((await backend.listWallets()).filter((w) => !w.isEntity).length, 0);
+  });
+
+  test('padded and control-character ids are rejected as malformed', async () => {
+    for (const id of [' treasury', 'treasury ', 'a\nb', 'x'.repeat(129)]) {
+      expectFail(await engine.submit({ type: 'OpenAccount', nonce: nonce('e'), actor: id }), 'INVALID_INTENT');
+    }
+  });
+
+  test('init refuses to start over a player wallet that sits on an entity id', async () => {
+    const otherBackend = new MemoryBackend();
+    const key = custody.createKeypair('casino-house');
+    await otherBackend.createWallet('casino-house', { pubkey: key.pubkey, address: key.address });
+    const config = { ...testConfig(), entities: [...testConfig().entities, { id: 'casino-house' }] };
+    const clashing = new EconomyEngine({ backend: otherBackend, custody, config });
+    await assert.rejects(clashing.init(), (e: unknown) => {
+      assert.equal((e as { code?: string }).code, 'ENTITY_ID_CONFLICT');
+      return true;
+    });
+  });
+});
+
+describe('EconomyEngine — Theft authorization', () => {
+  async function steal(authorizedBy: string, actor = 'robber'): Promise<EngineResponse> {
+    return await engine.submit({
+      type: 'Theft',
+      nonce: nonce('theft'),
+      actor,
+      victim: 'victim',
+      amount: '50',
+      authorizedBy,
+    });
+  }
+
+  test('free-text authorization is refused; only the victim or a configured admin counts', async () => {
+    await openAccount('robber');
+    await openAccount('victim');
+
+    expectFail(await steal('me-trust-me'), 'NOT_AUTHORIZED');
+    expectFail(await steal('robber'), 'NOT_AUTHORIZED');
+    assert.equal(await balanceOf('victim'), WELCOME_GRANT);
+
+    expectOk(await steal('victim'));
+    expectOk(await steal(ADMIN));
+    assert.equal(await balanceOf('victim'), WELCOME_GRANT - 100n);
+  });
+});
+
+describe('EconomyEngine — admin funding', () => {
+  test('mints into an entity wallet so a fresh world can pay out', async () => {
+    await openAccount('player-1');
+    const funded = expectOk(await engine.fundEntity('pd-payroll', '1000', nonce('fund')));
+    assert.equal(funded.newBalance, 1000n);
+
+    const tx = await backend.getTx(funded.txId);
+    assert.equal(tx?.kind, 'mint');
+    assert.equal(tx?.memo.intent, 'AdminFund');
+
+    const paid = expectOk(
+      await engine.submit({
+        type: 'Payout',
+        nonce: nonce('pay'),
+        actor: 'player-1',
+        employer: 'pd-payroll',
+        amount: '250',
+      }),
+    );
+    assert.equal(paid.newBalance, WELCOME_GRANT + 250n);
+  });
+
+  test('is not an intent: submit cannot name it', async () => {
+    const response = await engine.submit({
+      type: 'AdminFund',
+      nonce: nonce('x'),
+      actor: 'player-1',
+      entity: 'treasury',
+      amount: '1000',
+    } as unknown as Intent);
+    expectFail(response, 'INVALID_INTENT');
+    assert.equal(await balanceOf(TREASURY_ID), 0n);
+  });
+
+  test('only configured entities can be funded; players cannot', async () => {
+    await openAccount('player-1');
+    expectFail(await engine.fundEntity('player-1', '10', nonce('fund')), 'UNKNOWN_ENTITY');
+    expectFail(await engine.fundEntity('nobody', '10', nonce('fund')), 'UNKNOWN_ENTITY');
+    assert.equal(await balanceOf('player-1'), WELCOME_GRANT);
+  });
+
+  test('is replay-protected and validates the amount', async () => {
+    expectOk(await engine.fundEntity('treasury', '100', 'fund-once'));
+    expectFail(await engine.fundEntity('treasury', '100', 'fund-once'), 'DUPLICATE_NONCE');
+    for (const amount of ['0', '-5', '1.5', 'abc', '']) {
+      assert.equal((await engine.fundEntity('treasury', amount, nonce('fund'))).ok, false, amount);
+    }
+    assert.equal(await balanceOf('treasury'), 100n);
   });
 });
 

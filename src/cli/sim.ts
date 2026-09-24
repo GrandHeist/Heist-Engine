@@ -31,6 +31,9 @@ import type { EngineResponse, Intent, OwnerId, Tx, Wallet } from '../types.ts';
 const DEFAULT_DB_PATH = './heist.sqlite';
 const DEFAULT_HISTORY_LINES = 10;
 const PROMPT = 'heist> ';
+/** Entities `seed` tops up on an empty ledger so payouts and refunds have a source. */
+const DEMO_FUNDED_ENTITIES = ['treasury', 'bike-rental-co', 'taxi-co', 'pd-payroll'];
+const DEMO_FUNDING = '10000';
 
 /** Backends this adapter is allowed to spin up. On-chain is blocked in Custody anyway. */
 type SimBackendName = Extract<BackendName, 'memory' | 'sqlite'>;
@@ -83,12 +86,13 @@ const USAGE = [
   '  pay    <employer> <player> <amt>   employer pays a player',
   '  fine   <player> <amt>              player pays the treasury',
   '  send   <from> <to> <amt>           player to player',
-  '  rob    <robber> <victim> <amt> <authorizedBy>',
+  '  rob    <robber> <victim> <amt> <authorizedBy>   (authorizedBy: the victim, or a config admin)',
+  '  fund   <entity> <amt>              ADMIN: mint HD into an entity wallet (not an intent)',
   '  bal    <owner>                     balance',
   '  hist   <owner> [n]                 recent history (default 10)',
   '  wallets                            list every wallet',
   '  verify                             verify the hash chain and balances',
-  '  seed                               create a couple of demo players',
+  '  seed                               fund the payout entities, create a couple of demo players',
   '  help                               this list',
   '  exit                               quit',
 ].join('\n');
@@ -326,6 +330,17 @@ class Simulator {
         });
       }
 
+      case 'fund': {
+        const usage = 'fund <entity> <amt>';
+        return this.#render(
+          await this.#engine.fundEntity(
+            arg(args, 0, 'entity', usage),
+            amountArg(args, 1, 'amt', usage),
+            nonce(),
+          ),
+        );
+      }
+
       case 'bal':
         return await this.#balance(arg(args, 0, 'owner', 'bal <owner>'));
 
@@ -363,7 +378,11 @@ class Simulator {
   // -- intents -------------------------------------------------------------
 
   async #submit(intent: Intent): Promise<void> {
-    render(this.#config, await this.#engine.submit(intent));
+    this.#render(await this.#engine.submit(intent));
+  }
+
+  #render(response: EngineResponse): void {
+    render(this.#config, response);
   }
 
   // -- reads ---------------------------------------------------------------
@@ -429,8 +448,17 @@ class Simulator {
 
   // -- demo data -----------------------------------------------------------
 
-  /** Two demo players, opened the same way a real adapter would: an OpenAccount intent. */
+  /**
+   * Fund the entities that pay people (a fresh ledger has none), then open two demo players the
+   * same way a real adapter would: an OpenAccount intent. Funding is the admin path, not an intent.
+   */
   async #seed(): Promise<void> {
+    for (const entity of DEMO_FUNDED_ENTITIES) {
+      const wallet = await this.#backend.getWalletByOwner(entity);
+      if (wallet === null || (await this.#backend.getBalance(wallet.id)) > 0n) continue;
+      out(`  funding ${entity} with ${DEMO_FUNDING} ${this.#config.currency}`);
+      this.#render(await this.#engine.fundEntity(entity, DEMO_FUNDING, nonce()));
+    }
     for (const player of ['alice', 'bob']) {
       const existing = await this.#backend.getWalletByOwner(player);
       if (existing !== null) {

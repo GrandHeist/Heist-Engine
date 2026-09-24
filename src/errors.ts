@@ -52,6 +52,12 @@ export class NotAuthorized extends EngineError {
   }
 }
 
+export class AccountExists extends EngineError {
+  constructor(ownerId: string, address: string) {
+    super('ACCOUNT_EXISTS', `${ownerId} already has an account (${address}); the welcome grant is paid once`);
+  }
+}
+
 export class LedgerCorrupt extends EngineError {
   constructor(detail: string) {
     super('LEDGER_CORRUPT', detail);

@@ -18,6 +18,7 @@
 // ===========================================================================
 
 import {
+  AccountExists,
   DuplicateNonce,
   EngineError,
   InsufficientFunds,
@@ -72,6 +73,9 @@ export class EconomyEngine {
   readonly #config: HeistConfig;
   /** entity id -> display name, built once from config. */
   readonly #entities: Map<OwnerId, string>;
+  /** Lower-cased entity ids. Player ids may not collide with these, whatever the casing. */
+  readonly #entityKeys: Set<string>;
+  readonly #admins: Set<string>;
   /** Intents read-then-write across awaits, so they run one at a time. */
   readonly #lock = new Mutex();
 
@@ -80,6 +84,8 @@ export class EconomyEngine {
     this.#custody = options.custody;
     this.#config = options.config;
     this.#entities = new Map(options.config.entities.map((e) => [e.id, e.name ?? e.id]));
+    this.#entityKeys = new Set(options.config.entities.map((e) => e.id.toLowerCase()));
+    this.#admins = new Set(options.config.admins);
   }
 
   get config(): HeistConfig {
@@ -93,6 +99,18 @@ export class EconomyEngine {
    */
   async init(): Promise<void> {
     await this.#backend.init();
+
+    // Entity ids share the owner namespace with players. A player wallet already sitting on
+    // an entity's id (say, config gained a "casino-house" after a player joined as that)
+    // would be treated as the entity's wallet: refuse to start instead.
+    for (const wallet of await this.#backend.listWallets()) {
+      if (!wallet.isEntity && this.#isEntityId(wallet.ownerId)) {
+        throw new EngineError(
+          'ENTITY_ID_CONFLICT',
+          `A player wallet already uses the reserved entity id "${wallet.ownerId}"`,
+        );
+      }
+    }
     for (const entity of this.#config.entities) {
       await this.#ensureWallet(entity.id, true);
     }
@@ -103,8 +121,35 @@ export class EconomyEngine {
    * anything unexpected becomes code 'INTERNAL'.
    */
   async submit(intent: Intent): Promise<EngineResponse> {
+    return await this.#guarded(() => this.#route(intent));
+  }
+
+  /**
+   * ADMIN ONLY — not an Intent and not reachable through `submit`. Puts HD into an entity's
+   * wallet (mint) so payouts, refunds and welcome-free worlds have a source on a fresh ledger.
+   * Whoever holds the EconomyEngine object is the admin; the adapter surface (submit) has no
+   * way to name this operation. Replay-protected by `nonce` like any other write.
+   */
+  async fundEntity(entityId: OwnerId, amount: string, nonce: string): Promise<EngineResponse> {
+    return await this.#guarded(async () => {
+      assertNonEmpty(nonce, 'nonce');
+      assertNonEmpty(entityId, 'entityId');
+      if (await this.#backend.hasNonce(nonce)) throw new DuplicateNonce(nonce);
+      const value = this.#intentAmount(amount, 'amount');
+      const entity = await this.#requireEntityWallet(entityId);
+      const ref = await this.#backend.mint(entity.id, value, {
+        intent: 'AdminFund',
+        detail: `admin funding of ${this.#displayName(entityId)}`,
+        nonce,
+      });
+      return await this.#result(ref, entity.id, `Funded ${this.#displayName(entityId)} with ${this.#money(value)}.`);
+    });
+  }
+
+  /** Serialize, and turn every throw into a typed failure. */
+  async #guarded(work: () => Promise<IntentResult>): Promise<EngineResponse> {
     try {
-      return await this.#lock.run(() => this.#route(intent));
+      return await this.#lock.run(work);
     } catch (cause) {
       if (cause instanceof EngineError) {
         return { ok: false, code: cause.code, message: cause.message };
@@ -161,13 +206,30 @@ export class EconomyEngine {
   // Intent handlers
   // -------------------------------------------------------------------------
 
-  /** treasury -> new player. Mint the welcome grant; the treasury is the mint source. */
+  /**
+   * Open an account and pay the welcome grant — once per owner.
+   *
+   * The grant is a MINT, attributed to the treasury in the memo. The ledger records no source
+   * wallet for a mint ("treasury authority signs", types.ts), and treasury balance is fines
+   * revenue, not a supply pot; docs/adr/0004 explains why the grant is not a treasury transfer.
+   *
+   * A wallet that already has ledger history has had its grant. A wallet with none is an
+   * interrupted open (wallet written, mint not) and is completed rather than left grantless.
+   * Concurrent calls are serialized by the engine lock, so the check below cannot race.
+   */
   async #openAccount(intent: OpenAccountIntent): Promise<IntentResult> {
     this.#requireEntity(TREASURY_ID);
     const amount = parseAmount(this.#config.welcomeGrant, 'welcomeGrant');
     requirePositive(amount, 'welcomeGrant');
 
-    const player = await this.#ensureWallet(intent.actor, false);
+    this.#assertPlayerId(intent.actor, 'actor');
+    const existing = await this.#backend.getWalletByOwner(intent.actor);
+    if (existing !== null) {
+      if (existing.isEntity) throw new NotAuthorized(`"${intent.actor}" is an entity account`);
+      const history = await this.#backend.history(existing.id, undefined, 1);
+      if (history.txs.length > 0) throw new AccountExists(intent.actor, existing.address);
+    }
+    const player = existing ?? (await this.#ensureWallet(intent.actor, false));
 
     const ref = await this.#backend.mint(
       player.id,
@@ -190,7 +252,7 @@ export class EconomyEngine {
     const amount = this.#rentalCost(intent.vehicle, minutes);
     requirePositive(amount, 'rental cost');
 
-    const player = await this.#requireWallet(intent.actor);
+    const player = await this.#requirePlayerWallet(intent.actor, 'actor');
     const payee = await this.#requireEntityWallet(RENTAL_ENTITY);
 
     const ref = await this.#backend.transfer(
@@ -212,7 +274,7 @@ export class EconomyEngine {
     assertNonEmpty(intent.vehicle, 'vehicle');
     const minutesUnused = requireWholeCount(intent.minutesUnused, 'minutesUnused');
 
-    const player = await this.#requireWallet(intent.actor);
+    const player = await this.#requirePlayerWallet(intent.actor, 'actor');
     const payer = await this.#requireEntityWallet(RENTAL_ENTITY);
 
     let refund = this.#refundAmount(intent.vehicle, minutesUnused);
@@ -265,7 +327,7 @@ export class EconomyEngine {
     const amount = service.price * BigInt(units);
     requirePositive(amount, 'price');
 
-    const player = await this.#requireWallet(intent.actor);
+    const player = await this.#requirePlayerWallet(intent.actor, 'actor');
     const payee = await this.#requireEntityWallet(entityId);
 
     const ref = await this.#backend.transfer(
@@ -288,7 +350,7 @@ export class EconomyEngine {
     const amount = this.#intentAmount(intent.amount, 'amount');
 
     const employer = await this.#requireEntityWallet(intent.employer);
-    const player = await this.#requireWallet(intent.actor);
+    const player = await this.#requirePlayerWallet(intent.actor, 'actor');
 
     const ref = await this.#backend.transfer(
       employer.id,
@@ -308,7 +370,7 @@ export class EconomyEngine {
   async #fine(intent: FineIntent): Promise<IntentResult> {
     const amount = this.#intentAmount(intent.amount, 'amount');
 
-    const player = await this.#requireWallet(intent.actor);
+    const player = await this.#requirePlayerWallet(intent.actor, 'actor');
     const treasury = await this.#requireEntityWallet(TREASURY_ID);
 
     const reason = typeof intent.reason === 'string' && intent.reason.trim() !== ''
@@ -338,8 +400,8 @@ export class EconomyEngine {
     }
     const amount = this.#intentAmount(intent.amount, 'amount');
 
-    const from = await this.#requireWallet(intent.actor);
-    const to = await this.#requireWallet(intent.to);
+    const from = await this.#requirePlayerWallet(intent.actor, 'actor');
+    const to = await this.#requirePlayerWallet(intent.to, 'to');
 
     const ref = await this.#backend.transfer(
       from.id,
@@ -366,16 +428,24 @@ export class EconomyEngine {
     if (intent.victim === intent.actor) {
       throw new InvalidIntent('Cannot steal from yourself');
     }
+    // Whoever authorizes must be the victim (consent) or a configured admin. A free-text
+    // "authorizedBy" would authorize anything; naming the robber themselves authorizes nothing.
+    const authorizedBy = intent.authorizedBy.trim();
+    if (authorizedBy !== intent.victim && !this.#admins.has(authorizedBy)) {
+      throw new NotAuthorized(
+        `Theft must be authorized by the victim (consent) or a configured admin, not "${authorizedBy}"`,
+      );
+    }
     const amount = this.#intentAmount(intent.amount, 'amount');
 
-    const victim = await this.#requireWallet(intent.victim);
-    const robber = await this.#requireWallet(intent.actor);
+    const victim = await this.#requirePlayerWallet(intent.victim, 'victim');
+    const robber = await this.#requirePlayerWallet(intent.actor, 'actor');
 
     const ref = await this.#backend.transfer(
       victim.id,
       robber.id,
       amount,
-      this.#memo(intent, `theft from ${intent.victim}, authorized by ${intent.authorizedBy.trim()}`),
+      this.#memo(intent, `theft from ${intent.victim}, authorized by ${authorizedBy}`),
     );
 
     return await this.#result(
@@ -463,7 +533,12 @@ export class EconomyEngine {
   /** Create the wallet if absent, minting the keypair through Custody first. */
   async #ensureWallet(ownerId: OwnerId, isEntity: boolean): Promise<Wallet> {
     const existing = await this.#backend.getWalletByOwner(ownerId);
-    if (existing !== null) return existing;
+    if (existing !== null) {
+      if (isEntity && !existing.isEntity) {
+        throw new EngineError('ENTITY_ID_CONFLICT', `A player wallet already uses the entity id "${ownerId}"`);
+      }
+      return existing;
+    }
     return await this.#backend.createWallet(ownerId, this.#keyFor(ownerId), { isEntity });
   }
 
@@ -480,9 +555,26 @@ export class EconomyEngine {
     return { pubkey: keypair.pubkey, address: keypair.address };
   }
 
-  async #requireWallet(ownerId: OwnerId): Promise<Wallet> {
+  #isEntityId(ownerId: OwnerId): boolean {
+    return this.#entityKeys.has(ownerId.toLowerCase());
+  }
+
+  /** A well-formed owner id that is not an entity's. Entity ids never act as players. */
+  #assertPlayerId(ownerId: OwnerId, role: string): void {
+    assertOwnerId(ownerId, role);
+    if (this.#isEntityId(ownerId)) {
+      throw new NotAuthorized(`"${ownerId}" is an entity account and cannot be the ${role} of a player intent`);
+    }
+  }
+
+  /** The wallet of a PLAYER owner. Entity ids are rejected as actor / to / victim. */
+  async #requirePlayerWallet(ownerId: OwnerId, role: string): Promise<Wallet> {
+    this.#assertPlayerId(ownerId, role);
     const wallet = await this.#backend.getWalletByOwner(ownerId);
     if (wallet === null) throw new UnknownWallet(ownerId);
+    if (wallet.isEntity) {
+      throw new NotAuthorized(`"${ownerId}" is an entity account and cannot be the ${role} of a player intent`);
+    }
     return wallet;
   }
 
@@ -534,6 +626,21 @@ export class EconomyEngine {
 // ---------------------------------------------------------------------------
 // Small guards
 // ---------------------------------------------------------------------------
+
+/** Owner ids are opaque, but must be plain: no padding, no control characters, bounded. */
+function assertOwnerId(value: unknown, field: string): void {
+  if (
+    typeof value !== 'string' ||
+    value.length === 0 ||
+    value.length > 128 ||
+    value !== value.trim() ||
+    /[\u0000-\u001f\u007f]/.test(value)
+  ) {
+    throw new InvalidIntent(
+      `${field} must be a 1-128 character id with no leading/trailing whitespace or control characters`,
+    );
+  }
+}
 
 function assertNonEmpty(value: string, field: string): void {
   if (typeof value !== 'string' || value.trim() === '') {

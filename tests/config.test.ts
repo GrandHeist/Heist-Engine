@@ -382,3 +382,22 @@ describe('config — file errors', () => {
     }
   });
 });
+
+describe('config — admins', () => {
+  test('default to none and round-trip', () => {
+    assert.deepEqual(validateConfig({}).admins, []);
+    assert.deepEqual(validateConfig(withDefaults({ admins: ['staff-1', ' staff-2 '] })).admins, [
+      'staff-1',
+      'staff-2',
+    ]);
+  });
+
+  test('a non-array, non-string entry, duplicate or entity-id admin is rejected', () => {
+    throwsWithCode(() => validateConfig(withDefaults({ admins: 'staff' })), 'INVALID_INTENT', 'non-array');
+    throwsWithCode(() => validateConfig(withDefaults({ admins: [5] })), 'INVALID_INTENT', 'non-string');
+    throwsWithCode(() => validateConfig(withDefaults({ admins: [''] })), 'INVALID_INTENT', 'empty');
+    throwsWithCode(() => validateConfig(withDefaults({ admins: ['a', 'a'] })), 'INVALID_INTENT', 'dup');
+    throwsWithCode(() => validateConfig(withDefaults({ admins: ['treasury'] })), 'INVALID_INTENT', 'entity');
+    throwsWithCode(() => validateConfig(withDefaults({ admins: ['Treasury'] })), 'INVALID_INTENT', 'entity, other case');
+  });
+});
