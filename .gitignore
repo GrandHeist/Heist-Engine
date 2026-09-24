@@ -8,3 +8,14 @@ dist/
 coverage/
 *.sqlite
 *.sqlite-journal
+keys/
+*.pem
+*.key
+*keypair*.json
+.worktrees/
+NOTES.md
+BRIEF.md
+.next/
+.venv/
+venv/
+__pycache__/
