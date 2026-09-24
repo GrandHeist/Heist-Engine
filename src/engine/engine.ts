@@ -31,6 +31,7 @@ import { parseAmount, priceOf, rentalRateOf, serviceOf, TREASURY_ID } from '../c
 import type { HeistConfig } from '../config/config.ts';
 import type { LedgerBackend, WalletKeyInfo } from '../ledger/backend.ts';
 import type { Custody } from './custody.ts';
+import { Mutex } from './mutex.ts';
 import type {
   BuyServiceIntent,
   EngineResponse,
@@ -71,6 +72,8 @@ export class EconomyEngine {
   readonly #config: HeistConfig;
   /** entity id -> display name, built once from config. */
   readonly #entities: Map<OwnerId, string>;
+  /** Intents read-then-write across awaits, so they run one at a time. */
+  readonly #lock = new Mutex();
 
   constructor(options: EconomyEngineOptions) {
     this.#backend = options.backend;
@@ -101,7 +104,7 @@ export class EconomyEngine {
    */
   async submit(intent: Intent): Promise<EngineResponse> {
     try {
-      return await this.#route(intent);
+      return await this.#lock.run(() => this.#route(intent));
     } catch (cause) {
       if (cause instanceof EngineError) {
         return { ok: false, code: cause.code, message: cause.message };

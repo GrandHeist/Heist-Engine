@@ -317,6 +317,35 @@ describe('EconomyEngine — happy paths for all 8 intents', () => {
   });
 });
 
+describe('EconomyEngine — concurrency', () => {
+  test('concurrent ReturnVehicle intents cannot double-refund one rental', async () => {
+    await openAccount('player-1');
+    await fundEntity(RENTAL_ENTITY, 10_000n);
+    await engine.submit({
+      type: 'RentVehicle',
+      nonce: nonce('rent'),
+      actor: 'player-1',
+      vehicle: 'bike',
+      minutes: 10,
+    });
+
+    const returns = await Promise.all(
+      [1, 2, 3].map(() =>
+        engine.submit({
+          type: 'ReturnVehicle',
+          nonce: nonce('return'),
+          actor: 'player-1',
+          vehicle: 'bike',
+          minutesUnused: 10,
+        }),
+      ),
+    );
+
+    assert.equal(returns.filter((r) => r.ok).length, 1, 'exactly one refund may settle');
+    assert.equal(await balanceOf('player-1'), WELCOME_GRANT, 'rented 10, refunded 10, once');
+  });
+});
+
 describe('EconomyEngine — replay protection', () => {
   test('a replayed OpenAccount nonce does not double-grant', async () => {
     const first = expectOk(
