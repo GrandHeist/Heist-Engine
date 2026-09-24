@@ -1,7 +1,8 @@
 # ADR 0001 — Swappable ledger backend, with memory and SQLite first
 
 Date: 2026-07-21
-Status: Accepted
+Status: Accepted — **amended 2026-09-24**: only two of the three backends were built; the Postgres
+sections below describe intent, not code. Corrections are marked *Amended*.
 
 ## Context
 
@@ -14,33 +15,40 @@ Homebrew is available, so installing it is possible but is a system-level change
 before any code could run.
 
 Meanwhile Node 26 ships `node:sqlite` and ed25519 in `node:crypto` as built-ins, both verified working.
+(*Amended:* `package.json` requires Node >= 24, where `node:sqlite` is also available.)
 
 ## Decision
 
-Ship three off-chain backends behind the single interface, in this order:
+Put every ledger behind the single interface. The planned order was three off-chain backends:
 
-1. **`MemoryBackend`** — for tests and CI. No I/O, no setup, fast.
-2. **`SqliteBackend`** — real persistence via built-in `node:sqlite`. The default for local servers.
-3. **`PostgresBackend`** — written against the same SQL shape, activated when `DATABASE_URL` is set.
-   Requires the optional `pg` dependency. Untested until Postgres is installed.
+1. **`MemoryBackend`** — for tests and CI. No I/O, no setup, fast. **Built.**
+2. **`SqliteBackend`** — real persistence via built-in `node:sqlite`. The default for local servers. **Built.**
+3. **`PostgresBackend`** — to be written against the same SQL shape, activated when `DATABASE_URL` is set,
+   using the optional `pg` dependency. ***Amended: not written.*** No file, no test, no `pg` import
+   exists. `postgres` is a valid backend *name* in config and in `BackendName`, and `createBackend`
+   refuses it with `BACKEND_UNAVAILABLE`. The `optionalDependencies.pg` entry in `package.json` is
+   unused and can be dropped until this is built.
 
-Solana and BNB Chain remain unimplemented and gated, per the spec.
+Solana and BNB Chain remain unimplemented and gated, per the spec. Custody refuses to construct for
+them (`ONCHAIN_CUSTODY_BLOCKED`); enabling either takes an ADR and human sign-off, not a config change.
 
 ## Consequences
 
 **Good**
 - Nothing is blocked on a database install. The full economy runs end to end today.
-- Having three backends from day one *proves* the swappable claim instead of asserting it. A single
-  backend behind an interface is an untested abstraction.
+- Having two backends running the same conformance suite (and the whole engine suite) *proves* the
+  swappable claim instead of asserting it. A single backend behind an interface is an untested
+  abstraction. *Amended:* the claim is proven for two backends, not three.
 - Zero required runtime dependencies — `node:sqlite` and `node:crypto` are built in. `pg` is optional.
 - Small servers can run SQLite and never touch Postgres at all, which is a better default for the
   "drop it into your server" use case than requiring a database install.
 
 **Bad**
-- `PostgresBackend` ships unverified until someone installs Postgres. It must be treated as unproven
-  and must not be presented as tested.
-- Three implementations of one interface means three places every future ledger change must land.
-  The shared conformance test suite exists to make that cost visible rather than silent.
+- ***Amended:*** there is no Postgres backend. Nothing may describe Postgres as shipping, default or tested
+  (the README and SPEC did, and were corrected on 2026-09-24). When it is written it must pass the same
+  conformance and engine suites before it is called supported.
+- Each implementation of the interface is another place every ledger change must land (today two:
+  memory and sqlite). The shared conformance test suite exists to make that cost visible rather than silent.
 - `node:sqlite` is comparatively new; behaviour may shift across Node releases.
 
 **Reversal cost**

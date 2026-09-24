@@ -2,24 +2,61 @@
 
 [@GTAHeistEngine](https://x.com/GTAHeistEngine)
 
-A drop-in economy engine for GTA RP servers, built around a swappable ledger backend.
-Same engine, three deploy modes:
-
-- **Postgres mode** — off-chain, append-only, tamper-evident ledger. Ships today, no platform-ToS friction.
-- **Solana mode** — SPL token "HD," server-custodied wallets, sub-second settlement. Gated until platform approval.
-- **BNB Chain mode** — ERC-20 HD, server-custodied wallets. Gated until platform approval.
-
-Runs on **FiveM** (Lua adapter), **RageMP** (JS adapter), or **standalone simulator** (CLI/web).
-
-The core idea: every economic action in the world (rent a bike, pay the hospital, get a payout, fines)
-is a typed, signed transfer between wallets. Players are server-custodied — zero in-game friction.
+An economy engine for GTA RP servers built around a swappable ledger backend. Every economic action in
+the world (rent a bike, pay the hospital, get a payout, fines) is a typed intent that the engine turns
+into a transfer, mint or burn on an append-only, hash-chained ledger of player and entity wallets.
 
 The in-game currency is **HD** — Heist Dollars.
 
+## What exists today
+
+| | Status |
+|---|---|
+| Economy engine (8 intents + an admin funding call), config-driven prices and entities | **works** |
+| **Memory** ledger backend (tests, dry runs) | **works** |
+| **SQLite** ledger backend (`node:sqlite`, file-backed, hash-chained, tamper-checked) | **works** |
+| Standalone CLI simulator (`npm run sim`) | **works** |
+| **Postgres** backend | *not written.* It is a valid name in config and is refused at startup |
+| **Solana / BNB Chain** backends | *not written, and gated on purpose.* Custody refuses on-chain modes until a human signs off (see `src/engine/custody.ts`) |
+| **Signed transactions** | *designed, not implemented.* Ledger rows are hash-chained but their `signature` column is empty. See [ADR 0003](docs/adr/0003-signing-design.md) |
+| **Adapter authentication**, HTTP/WS server | *not written.* The engine is a library; only the CLI drives it |
+| **FiveM** (Lua) and **RageMP** (JS) adapters | *not written* |
+| Persistent custody keys | *not written.* Keys live in process memory and are lost on restart |
+
+So the honest pitch today: a tested, tamper-evident, off-chain economy ledger you can drive from a CLI.
+Everything else in the spec is design.
+
+## Try it
+
+Node 24 or newer (`node:sqlite` is built in; there are no runtime dependencies).
+
+```sh
+npm install        # dev dependencies only: typescript, @types/node
+npm run check      # typecheck + the full test suite
+npm run sim        # interactive simulator, in-memory ledger
+npm run sim -- --backend=sqlite --db=./heist.sqlite    # persistent ledger
+```
+
+In the sim, `seed` funds the payout entities and opens two demo players; `help` lists the commands.
+The sim verifies the ledger on every start and refuses to run on one that fails. See
+[ADR 0006](docs/adr/0006-store-hardening-and-checkpoints.md) for exactly what that check does and does
+not catch.
+
+## How money moves
+
+- An adapter sends an **intent** (`OpenAccount`, `RentVehicle`, `ReturnVehicle`, `BuyService`, `Payout`,
+  `Fine`, `Transfer`, `Theft`). It never names a ledger operation and never touches balances.
+- The engine validates it against the world rules, then writes one ledger row. Money is `bigint` end to
+  end; amounts are decimal strings on the wire ([ADR 0002](docs/adr/0002-money-as-bigint-stored-as-text.md)).
+- Entity accounts (`treasury`, `hospital`, ...) are funded by an admin call on the engine object, which is
+  deliberately not an intent.
+- Who may do what, and what still needs adapter authentication: [ADR 0004](docs/adr/0004-engine-authority-and-welcome-grant.md).
+
 ## For server owners
 
-Heist Engine is meant to drop into your server: install the adapter for your framework, point it at the
-engine, and your economy becomes an auditable ledger instead of a number in a database.
+The goal is a drop-in engine: install an adapter for your framework, point it at the engine, and your
+economy becomes an auditable ledger instead of a number in a database. **That goal is not met yet.** There
+are no adapters and no network interface, so today this is for developers. Status: in development.
 
-Status: **in development.** See [`docs/SPEC.md`](docs/SPEC.md) for the architecture and intent catalog,
-and [`docs/adr/`](docs/adr/) for decisions that are expensive to reverse.
+See [`docs/SPEC.md`](docs/SPEC.md) for the architecture and intent catalog (each section says what is built and
+what is planned) and [`docs/adr/`](docs/adr/) for decisions that are expensive to reverse.

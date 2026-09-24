@@ -1,25 +1,46 @@
 # Heist Engine — Spec
 
+> **How to read this document.** It began as a design and still describes the target. Corrected
+> 2026-09-24 so it no longer claims things the code does not do. Every section is tagged
+> **[built]**, **[partly built]** or **[planned]**. When in doubt, the code and the ADRs in
+> [`docs/adr/`](adr/) win over this file.
+
 ## What it is
 
-A plugin that replaces a GTA RP server's in-game economy with a transparent, auditable ledger of player and NPC-entity wallets. Players spawn with a wallet, every economic action (rent a bike, pay hospital, get paid for a job, fines, robberies) is a signed transfer between wallets. The ledger backend is swappable: **Postgres** (off-chain, ToS-safe today) or **Solana / BNB Chain** (real on-chain, pending platform approval).
+A plugin that replaces a GTA RP server's in-game economy with a transparent, auditable ledger of player and NPC-entity wallets. Players spawn with a wallet, and every economic action (rent a bike, pay hospital, get paid for a job, fines, robberies) is a transfer, mint or burn on that ledger. The ledger backend is swappable behind one interface. Today two backends exist: **memory** and **SQLite** (both off-chain). A **Postgres** backend is planned but not written. **Solana / BNB Chain** backends are planned, deliberately blocked, and are not a config flag (see below).
 
 This is a private friends server. No real-money entry/exit, no sale of HD, no advertised public listing. HD = "Heist Dollar," the only currency in the world.
 
+## Status at a glance
+
+| Piece | Status |
+|---|---|
+| Intent router, config, entity wallets, admin funding | **[built]** |
+| Memory + SQLite backends, hash chain, integrity verification, checkpoints | **[built]** |
+| Standalone CLI simulator | **[built]** |
+| Postgres backend | **[planned]**, not written |
+| Solana / BNB Chain backends | **[planned]**, blocked by Custody until an ADR + human sign-off |
+| Signed ledger rows (payer key signs each tx) | **[planned]**, designed in [ADR 0003](adr/0003-signing-design.md); `signature` is always null today |
+| Adapter authentication, HTTP/WS surface | **[planned]**, designed in ADR 0003; the engine is a library today |
+| FiveM / RageMP adapters | **[planned]**, not written |
+| Persistent custody keys | **[planned]**; keys live in process memory today |
+| Admin dashboard | **[planned]** |
+
 ## Goals
 
-- One plugin codebase that runs on **FiveM**, **RageMP**, and a **standalone Postgres mode** (for dev/dry-run and ToS-safe operation).
-- Ledger backend is a swappable adapter — Postgres / Solana / BSC behind the same interface.
-- Every economic action is a signed, auditable transaction. Nothing changes a balance except a transfer, mint, or burn.
-- Server-custodial wallets — players never sign anything in-game. Zero friction.
-- Talking-point ready: when we meet Cfx.re / RageMP / Take-Two, we can demo the Postgres mode and explain the on-chain modes as a config flip.
+- One engine that a FiveM Lua resource, a RageMP package and the standalone sim can all drive. *(Only the sim exists.)*
+- Ledger backend is a swappable adapter behind one interface. *(Proven for two backends by shared conformance and engine suites.)*
+- Every economic action is an auditable, append-only, hash-chained transaction. Nothing changes a balance except a transfer, mint, or burn. **[built]**
+- Every transaction is *signed* by a wallet key. **[planned]** — the hash chain detects edits to history, but without signatures someone who can write the database and recompute hashes can append forged rows. See ADR 0006 (what is and is not caught) and ADR 0003.
+- Server-custodial wallets — players never sign anything in-game. Zero friction. *(Custody generates and holds keys; persistence across restarts is not built.)*
+- Talking-point ready: when we meet Cfx.re / RageMP / Take-Two, we can demo the off-chain mode today. The on-chain modes are a **design option that needs its own work and sign-off**, not a switch: they need a backend, real key custody, an ADR and explicit human approval first.
 
 ## Non-goals (v1)
 
 - No real-money on/off-ramp. HD is not redeemable for fiat.
 - No DEX, no AMM, no lending — closed economy.
 - No NFTs for items (vehicles, houses) in v1. Items live in the game DB. Maybe v2.
-- No anti-cheat hardening beyond signed intents — this is a trusted-friends server.
+- No anti-cheat hardening beyond what the engine can check itself — this is a trusted-friends server. (Note: without adapter authentication, anything that can call the engine can claim any actor. See ADR 0004.)
 
 ## Architecture
 
@@ -32,171 +53,187 @@ This is a private friends server. No real-money entry/exit, no sale of HD, no ad
 │  │                CLI sim for standalone)           │        │
 │  └────────────────────┬────────────────────────────┘        │
 └───────────────────────┼─────────────────────────────────────┘
-                        │  Intent (HTTP/WS, signed by server key)
+                        │  Intent   (planned: HTTP/WS with an HMAC envelope, ADR 0003;
+                        │            today: a direct call to engine.submit())
                         ▼
 ┌─────────────────────────────────────────────────────────────┐
-│ Economy Engine  (Node.js / TypeScript service)              │
+│ Economy Engine  (Node.js / TypeScript library)              │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐   │
-│  │ Intent Router│  │ Pricing/Rules│  │ Custody (MPC/KV) │   │
+│  │ Intent Router│  │ Pricing/Rules│  │ Custody (in-mem) │   │
 │  └──────┬───────┘  └──────┬───────┘  └────────┬─────────┘   │
-│         └──── validates, prices, signs ────────┘            │
+│         └── validates, prices; (planned: signs) ┘           │
 └────────────────────────────┬────────────────────────────────┘
                              │  Ledger op (transfer/mint/burn)
                              ▼
 ┌─────────────────────────────────────────────────────────────┐
 │ Ledger Backend (swappable, single interface)                │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐   │
-│  │  Postgres    │  │   Solana     │  │  BNB Chain       │   │
-│  │  append-only │  │   SPL HD     │  │  ERC-20 HD       │   │
+│  │ memory+sqlite│  │  Postgres    │  │ Solana / BNB     │   │
+│  │   [built]    │  │  [planned]   │  │ [planned,blocked]│   │
 │  └──────────────┘  └──────────────┘  └──────────────────┘   │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### 1. Game Adapter (in-game)
+### 1. Game Adapter (in-game) — [planned; only the CLI sim is built]
 
-A thin layer that runs inside the GTA server framework. Its only job: turn in-game events into typed economy **Intents** and ship them to the Economy Engine over local HTTP/WS.
+A thin layer that runs inside the GTA server framework. Its only job: turn in-game events into typed economy **Intents** and hand them to the Economy Engine.
 
 | Event | Intent |
 |---|---|
-| Player joins for the first time | `OpenAccount(player)` → engine creates wallet, mints welcome grant |
-| Player interacts with bike rental NPC | `RentVehicle(player, "bike", duration)` |
-| Player enters hospital | `BuyService(player, "hospital", "full-heal")` |
+| Player joins | `OpenAccount(player)` → welcome grant, **once per player** (repeat calls return `ACCOUNT_EXISTS`) |
+| Player interacts with bike rental NPC | `RentVehicle(player, "bike", minutes)` → returns a `txId`, which is the rental id |
+| Player returns the bike | `ReturnVehicle(player, rentalId, minutesUnused)` |
+| Player enters hospital | `BuyService(player, "hospital_full_heal")` |
 | Player completes a paying job | `Payout(employer="taxi-co", player, amount)` |
-| Player robs another player | `Transfer(victim, robber, amount, reason="theft")` |
-| Cop fines player | `Fine(player, treasury, amount)` |
+| Player robs another player | `Theft(victim, robber, amount, authorizedBy)` — `authorizedBy` must be the victim (consent) or a configured admin |
+| Cop fines player | `Fine(player, amount, reason)` → pays the treasury |
+| `/pay 02 50` | `Transfer(from, to, amount)` |
 
-Adapter implementations:
-- **FiveM**: Lua resource. Uses `PerformHttpRequest` to talk to the engine. Subscribes to standard events (`playerJoining`, `onResourceStart`, plus framework events from ESX/QBCore for shops, vehicles, etc.).
-- **RageMP**: JavaScript package, uses native `fetch`. Same intent contracts.
-- **Standalone sim**: a CLI / web UI that simulates player events. Useful for dev, demos, and arguing with companies without booting a real GTA server.
+Adapter implementations (none written yet):
+- **FiveM**: Lua resource. Would use `PerformHttpRequest` once the engine has an HTTP surface.
+- **RageMP**: JavaScript package, native `fetch`. Same intent contracts.
+- **Standalone sim** **[built]**: a CLI (`npm run sim`) that simulates player events. Useful for dev, demos, and arguing with companies without booting a real GTA server.
 
-The adapter never touches balances directly. It only emits intents and renders the engine's response (e.g., "✓ Paid $10 HD. Bike spawning…").
+The adapter never touches balances directly. It only emits intents and renders the engine's response (e.g., "✓ Paid 10 HD. Bike spawning…"). It must treat `ok: true` as final: the ledger write has settled even if `newBalance` is `null`.
 
-### 2. Economy Engine (Node.js service)
+### 2. Economy Engine — [built, as a library]
 
 The brain. Owns:
-- **Intent router** — validates each intent against the world rules (does the player have enough? Is the NPC entity real? Is the price right?).
-- **Pricing/rules** — config-driven prices for services. JSON/YAML, hot-reloadable.
-- **Custody** — manages player wallet keys server-side. Two modes:
-  - *Encrypted KV* (v1): private keys encrypted at rest with a server master key. Simple, fine for friends server.
-  - *MPC* (v2): threshold signature so no single key can move funds. Overkill for v1 but the interface should support it.
-- **Settlement** — produces a ledger operation (transfer/mint/burn) and hands it to the backend.
+- **Intent router** **[built]** — validates each intent against the world rules (does the player have enough? Is the entity real? Is the price right? Is this an entity id pretending to be a player?). Intents run one at a time behind a mutex (ADR 0005).
+- **Pricing/rules** **[built]** — config-driven prices and entities, JSON (`heist.config.json`), validated at load. Not hot-reloadable yet.
+- **Custody** **[partly built]** — generates and holds ed25519 keys in process memory, refuses on-chain backends. Persistence (encrypted at rest, or derived from a master seed) is **[planned]**, options in ADR 0003. MPC is a v2 idea.
+- **Settlement** **[built]** — produces a ledger operation and hands it to the backend, atomically with the nonce and key guards.
 
-Intent flow:
+Intent flow, as built:
 ```
-1. Adapter POSTs Intent {type, payload, sig=server_key(adapter)}
-2. Engine validates: schema, balance, entity exists, price matches catalog
-3. Engine signs the resulting ledger op with the payer's custodial key
-4. Engine calls LedgerBackend.transfer(...)
-5. Engine returns {ok, txId, newBalance} to adapter
-6. Adapter triggers the in-game effect (spawn bike, restore health)
+1. Caller invokes engine.submit(intent {type, nonce, actor, ...})
+2. Engine validates: schema, ids, entity/player separation, balance, price, authorization claims
+3. Engine calls LedgerBackend.transfer / mint / burn (atomic: row + balances + nonce + key)
+4. Engine returns {ok, txId, hash, newBalance, message}, or {ok:false, code, message}
+5. The adapter triggers the in-game effect (spawn bike, restore health)
 ```
 
-If the ledger op fails, the in-game effect does NOT happen. Atomicity is engine-side: don't spawn the bike before the transfer settles.
+Planned additions to that flow (ADR 0003): authenticate the adapter envelope before step 2, and sign the canonical payload with the payer's custodial key inside step 3.
+
+If the ledger op fails, the in-game effect does NOT happen. Atomicity is engine-side: don't spawn the bike before the transfer settles. A retry of an already-settled intent (same nonce, same actor, same type) returns the original result with `replayed: true`.
 
 ### 3. Ledger Backend (swappable)
 
-Single TypeScript interface:
+The interface in `src/ledger/backend.ts` (summarised):
 
 ```ts
 interface LedgerBackend {
-  createWallet(ownerId: string): Promise<Wallet>;          // { id, address, pubkey }
-  getBalance(walletId: string): Promise<bigint>;
-  transfer(from: WalletId, to: WalletId, amount: bigint, memo: Memo): Promise<TxRef>;
-  mint(to: WalletId, amount: bigint, memo: Memo): Promise<TxRef>;   // admin-only
-  burn(from: WalletId, amount: bigint, memo: Memo): Promise<TxRef>;
-  history(walletId: string, cursor?: string): Promise<Tx[]>;
+  init(): Promise<void>;  close(): Promise<void>;
+  createWallet(ownerId, key: { pubkey, address }, opts?): Promise<Wallet>;   // idempotent per owner
+  getWallet(id) / getWalletByOwner(ownerId) / listWallets();
+  getBalance(walletId): Promise<bigint>;
+  transfer(from, to, amount: bigint, memo): Promise<TxRef>;
+  mint(to, amount, memo): Promise<TxRef>;      // money enters the world
+  burn(from, amount, memo): Promise<TxRef>;
+  history(walletId, cursor?, limit?): Promise<HistoryPage>;
+  getTx(txId) / getTxByNonce(nonce) / hasNonce(nonce);
+  verifyIntegrity(expected?: Checkpoint): Promise<IntegrityReport>;
+  checkpoint(): Promise<Checkpoint | null>;
 }
 ```
 
-Three implementations:
+Backends receive only the *public* half of a wallet's keypair; they never generate or store private keys.
 
-**Postgres backend** (default, ToS-safe):
-- `wallets(id, owner_id, address, pubkey, created_at)`
-- `transactions(id, from_wallet, to_wallet, amount, memo, prev_hash, hash, signature, created_at)` — append-only, hash-chained for tamper evidence
-- `balances` view = sum of credits − debits per wallet
-- Wallets are ed25519 keypairs; transfers signed by sender's custodial key — exactly like an on-chain tx, just settled in SQL
-- Public read endpoint so the whole ledger is auditable
+**Memory backend** [built]: reference implementation, for tests and dry runs.
 
-**Solana backend**:
-- HD = SPL token, mint authority = server multisig
-- Player wallet = Solana keypair, custodied by engine
-- `transfer` = SPL transfer tx, server signs as payer + fee payer
-- Sub-second finality, ~$0.0001 per tx — fits in-game cadence
+**SQLite backend** [built]: the default for a real local server. `node:sqlite`, file-backed, WAL, `synchronous=FULL`.
+- `wallets`, `transactions` (hash-chained: `seq`, `prev_hash`, `hash`, `signature` — **always null today**), a maintained `balances` table (not a SQL view; amounts are TEXT, see ADR 0002), and replay-guard tables `nonces` and `memo_keys`.
+- Append-only triggers, `CHECK` constraints, foreign keys (ADR 0006).
+- `verifyIntegrity` checks hashes, ledger rules, balances, replay guards and an optional external checkpoint.
 
-**BNB Chain backend**:
-- HD = ERC-20 token, mint authority = server multisig (Gnosis Safe)
-- Player wallet = EVM keypair, custodied by engine
-- `transfer` = ERC-20 transfer, server pays gas
-- Slower (~3s blocks) — fine for slow actions, friction for rapid ones
+**Postgres backend** [planned, not written]: the same SQL shape as SQLite, using the `pg` package. A `postgres` config value is accepted by the loader and refused at startup.
 
-The on-chain backends are gated behind a config flag and require platform approval before being enabled on FiveM/RageMP.
+**Solana backend** [planned, blocked]: HD as an SPL token, server multisig mint authority, server-custodied player keypairs. **BNB Chain backend** [planned, blocked]: ERC-20 HD, Gnosis Safe mint authority. Both would make the engine a custodian of real transferable on-chain assets, which is what `Custody` refuses (`ONCHAIN_CUSTODY_BLOCKED`). Turning either on requires: a backend implementation, an ADR covering key generation / encryption / recovery / blast radius, and explicit human sign-off. It is not a config flag.
 
-## Entity wallets (NPC accounts)
+## Entity wallets (NPC accounts) — [built]
 
 The economy has wallets that aren't players:
 
 | Entity | Purpose |
 |---|---|
-| `treasury` | Mint source. Welcome grants, salary payouts originate here. |
-| `bike-rental-co` | Receives rental fees. |
+| `treasury` | Mint authority for welcome grants (a grant is a mint attributed to the treasury, ADR 0004). Also receives fines. |
+| `bike-rental-co` | Receives rental fees, pays refunds. |
 | `hospital` | Receives medical fees. |
 | `gas-station-N` | One per gas station. |
 | `taxi-co`, `pd-payroll`, etc. | Job-based payouts. |
 | `casino-house` (later) | Gambling sink, if we add it. |
 
-Entity wallets are owned by the server but each is a real, addressable ledger account. Lets us see the full flow of money — e.g., "the hospital made 12,400 HD this week."
+Entity wallets are owned by the server but each is a real, addressable ledger account, so you can see the full flow of money — e.g., "the hospital made 12,400 HD this week." Entity ids are **reserved**: a player intent can never name one as actor, recipient or victim. Entities start empty; an operator funds them with `EconomyEngine.fundEntity` (admin only, not an intent; the sim's `fund` command).
 
-## Intent catalog (v1)
+## Intent catalog (v1) — [built]
 
 | Intent | Payer | Payee | Trigger |
 |---|---|---|---|
-| `OpenAccount` | `treasury` | new player | first join (welcome grant, e.g. 500 HD) |
-| `RentVehicle` | player | `bike-rental-co` | NPC interaction |
-| `ReturnVehicle` | `bike-rental-co` | player | return early, partial refund |
+| `OpenAccount` | mint (treasury authority) | new player | first join; once per owner; welcome grant from config |
+| `RentVehicle` | player | `bike-rental-co` | NPC interaction; records `vehicle` and `minutes` in the tx |
+| `ReturnVehicle` | `bike-rental-co` | player | return by rental id; refund is `paid × unused / rented`; once per rental |
 | `BuyService` | player | service entity | hospital, gas, food |
 | `Payout` | employer entity | player | end-of-shift, job completion |
 | `Fine` | player | `treasury` | police action |
-| `Transfer` | player | player | direct send (`/pay 02 50ocd`) |
-| `Theft` | victim | robber | mugging RP, requires both consent or admin |
+| `Transfer` | player | player | direct send (`/pay 02 50`) |
+| `Theft` | victim | robber | needs the victim's consent or a configured admin |
+| *(not an intent)* `fundEntity` | mint | entity | operator only |
+
+**What the engine cannot verify.** Until adapter authentication exists (ADR 0003), the engine takes the `actor` and any `authorizedBy` claim at the adapter's word. It checks that they are well-formed, that entities are not players, and that an authorizer is the victim or a configured admin. It cannot check that the adapter is telling the truth. ADR 0004 lists exactly what remains open.
 
 ## Config example
 
-```yaml
-backend: postgres   # or "solana", "bsc"
-welcome_grant: 500
-currency: HD
-prices:
-  bike_rental: 10
-  hospital_full_heal: 200
-  gas_per_liter: 2
-entities:
-  - { id: bike-rental-co, name: "Crystal Bikes" }
-  - { id: hospital, name: "Pillbox Medical" }
-  - { id: treasury }
+The real format is JSON (`heist.config.json`, validated at load; there is no YAML dependency):
+
+```json
+{
+  "backend": "sqlite",
+  "dbPath": "./heist.sqlite",
+  "currency": "HD",
+  "welcomeGrant": "500",
+  "admins": [],
+  "prices": { "bike_rental": "10" },
+  "rentalPerMinute": { "bike": "1", "car": "3", "helicopter": "25" },
+  "services": {
+    "hospital_full_heal": { "entity": "hospital", "price": "200" },
+    "gas_per_liter": { "entity": "gas-station-1", "price": "2" }
+  },
+  "entities": [
+    { "id": "treasury", "name": "City Treasury" },
+    { "id": "bike-rental-co", "name": "Crystal Bikes" },
+    { "id": "hospital", "name": "Pillbox Medical" },
+    { "id": "gas-station-1", "name": "Xero Gas — Strawberry" }
+  ]
+}
 ```
+
+Money values are quoted decimal strings, never JSON numbers, and zero prices are rejected. `backend` is `memory` or `sqlite` today; `postgres`, `solana` and `bsc` are accepted names that fail at startup.
 
 ## Why this design works for the company conversations
 
-- **Postgres mode is shippable today** without breaching FiveM's Creator Platform License Agreement — it's just a server-side economy database. No tokens, no crypto assets.
-- The on-chain backends are an **architectural option**, not a required feature. We can demo Postgres mode to Cfx.re and say: "the codebase supports a Solana backend; we won't enable it until you bless it."
-- **The intent layer is the actual innovation** — typed, signed, auditable economic actions. Useful even without crypto.
-- If Cfx.re ever opens up to crypto (unlikely soon), we flip a config flag. If they don't, we still have a great off-chain economy plugin.
+- **The off-chain mode is shippable in principle** without breaching FiveM's Creator Platform License Agreement — it is just a server-side economy database. No tokens, no crypto assets. *(In practice there is no adapter yet, so nothing is shippable to a server today.)*
+- The on-chain backends are an **architectural option**, not a feature. The honest statement to Cfx.re is: "the ledger sits behind an interface that could take a Solana backend; we have not written one, custody blocks it, and we will not enable it unless you bless it."
+- **The intent layer is the actual innovation** — typed, auditable economic actions. Useful even without crypto.
+- If Cfx.re ever opens up to crypto (unlikely soon), a backend, custody and approval are needed first. It is a project, not a flag flip. If they don't, we still have an off-chain economy plugin.
 
-## Open questions to resolve before building
+## Open questions
 
-1. Single Economy Engine for all three game adapters, or one engine per game? (Default: single, multi-tenant.)
+1. Single Economy Engine for all game adapters, or one engine per game? (Default: single, multi-tenant. Not started.)
 2. Welcome grant amount, prices, salary rates — needs a balance pass.
-3. What happens when a player rage-quits mid-rental? Refund logic.
-4. Do we want anti-double-spend / nonce on intents from the adapter? (Yes — replay protection.)
-5. Admin UI: web dashboard for minting, viewing entity P&L, banning a wallet.
-6. Backup/recovery story for the encrypted KV custody.
+3. ~~What happens when a player rage-quits mid-rental?~~ Partly answered: a rental is a ledger record (ADR 0005), so an unreturned rental stays open and can be refunded later. There is no timeout or automatic close, and `minutesUnused` is adapter-reported, not clock-verified.
+4. ~~Do we want anti-double-spend / nonce on intents?~~ Yes, built: nonces, replay returns the original result, and business keys make grants and refunds once-only (ADR 0005).
+5. Admin UI: web dashboard for minting, viewing entity P&L, banning a wallet. (Planned.)
+6. Backup/recovery story for custody keys. **Open and now blocking signing**: see ADR 0003, part 3.
+7. Adapter authentication and per-adapter capabilities (who may submit `Payout`, `Fine`, `Theft`). Designed in ADR 0003, not built.
+8. Where to keep the head checkpoint so it means something (ADR 0006).
 
-## Build order (when we start)
+## Build order
 
-1. Economy Engine + Postgres backend + standalone CLI adapter — full economy works without any GTA server.
-2. FiveM Lua adapter — connect to a local FiveM dev server, port one interaction (bike rental).
-3. RageMP JS adapter — same interaction, different framework.
-4. Solana backend behind a feature flag — same engine, same intents, real SPL transfers.
-5. BSC backend behind a feature flag.
-6. Admin dashboard.
+1. ✅ Economy Engine + memory and SQLite backends + standalone CLI adapter — the full economy works without any GTA server.
+2. Persistent custody keys, signed ledger rows, adapter authentication + HTTP surface (ADR 0003). Prerequisite for any real adapter.
+3. FiveM Lua adapter — connect to a local FiveM dev server, port one interaction (bike rental).
+4. RageMP JS adapter — same interaction, different framework.
+5. Postgres backend, if SQLite stops being enough.
+6. Solana backend behind explicit approval — same intents, real SPL transfers.
+7. BNB Chain backend behind explicit approval.
+8. Admin dashboard.
