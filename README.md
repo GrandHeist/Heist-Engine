@@ -23,7 +23,7 @@ The in-game currency is **HD** — Heist Dollars.
 | **FiveM** (Lua) and **RageMP** (JS) adapters | *not written* |
 | Persistent custody keys | *not written.* Keys live in process memory and are lost on restart |
 
-So the honest pitch today: a tested, tamper-evident, off-chain economy ledger you can drive from a CLI.
+So the honest pitch today: a tested, off-chain economy ledger you can drive from a CLI. Its transaction history is hash-chained, so edits to it are detectable; it is not yet tamper-proof (no signatures, and the wallet registry is not covered: see ADR 0006).
 Everything else in the spec is design.
 
 ## Try it
