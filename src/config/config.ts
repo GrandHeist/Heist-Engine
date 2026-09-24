@@ -12,7 +12,7 @@
 
 import { readFileSync } from 'node:fs';
 import { isAbsolute, resolve } from 'node:path';
-import { EngineError, InvalidIntent, UnknownEntity } from '../errors.ts';
+import { EngineError, InvalidAmount, InvalidIntent, UnknownEntity } from '../errors.ts';
 import type { BackendName } from '../ledger/backend.ts';
 
 /** An NPC/system account. `treasury` is mandatory — it is the mint source. */
@@ -72,40 +72,63 @@ const DEFAULT_CONFIG_FILENAME = 'heist.config.json';
 // Money parsing
 // ---------------------------------------------------------------------------
 
+/** More digits than this is not a plausible amount and is refused before BigInt sees it. */
+const MAX_AMOUNT_DIGITS = 30;
+
 /**
- * Parse a decimal money string into whole-HD bigint.
+ * Parse a decimal money string into whole-HD bigint, for any caller (an intent off the wire, a
+ * config value). Throws InvalidAmount with a message about the value only — no "config:" — so it
+ * can be shown to an adapter as it stands. `parseAmount` below is the config-flavoured wrapper.
  *
  * Accepts "500", "0", "500.00" (a zero fractional part is tolerated so hand-written
- * config does not blow up). Rejects negatives, fractions of an HD, exponent
- * notation, and anything non-numeric. `field` is only used to build the message.
+ * config does not blow up). Rejects negatives, fractions of an HD, exponent notation,
+ * anything non-numeric, and absurdly long numbers. `field` names the value in the message.
  */
-export function parseAmount(value: string, field: string): bigint {
+export function parseAmountText(value: unknown, field: string): bigint {
   if (typeof value !== 'string') {
-    throw new InvalidIntent(
-      `config: ${field} must be a decimal string, got ${describe(value)}. ` +
+    throw new InvalidAmount(
+      `${field} must be a decimal string, got ${describe(value)}. ` +
         `Money is never a JSON number — quote it, e.g. "500".`,
     );
   }
   const trimmed = value.trim();
   const match = /^(\d+)(?:\.(\d+))?$/.exec(trimmed);
   if (match === null) {
-    throw new InvalidIntent(
-      `config: ${field} is not a non-negative decimal string: ${JSON.stringify(value)}`,
-    );
+    throw new InvalidAmount(`${field} is not a non-negative decimal string: ${JSON.stringify(value)}`);
   }
   const fraction = match[2];
   if (fraction !== undefined && /[^0]/.test(fraction)) {
-    throw new InvalidIntent(
-      `config: ${field} = ${JSON.stringify(value)} has a fractional part. ` +
-        `HD is indivisible — amounts must be whole.`,
+    throw new InvalidAmount(
+      `${field} = ${JSON.stringify(value)} has a fractional part. HD is indivisible — amounts must be whole.`,
     );
   }
   // match[1] is guaranteed by the regex; noUncheckedIndexedAccess needs the guard.
   const whole = match[1];
   if (whole === undefined) {
-    throw new InvalidIntent(`config: ${field} could not be parsed: ${JSON.stringify(value)}`);
+    throw new InvalidAmount(`${field} could not be parsed: ${JSON.stringify(value)}`);
+  }
+  if (whole.replace(/^0+(?=\d)/, '').length > MAX_AMOUNT_DIGITS) {
+    throw new InvalidAmount(`${field} has more than ${MAX_AMOUNT_DIGITS} digits`);
   }
   return BigInt(whole);
+}
+
+/** Config-flavoured `parseAmountText`: same grammar, but a bad value is a config error. */
+export function parseAmount(value: string, field: string): bigint {
+  try {
+    return parseAmountText(value, field);
+  } catch (cause) {
+    if (cause instanceof InvalidAmount) throw new InvalidIntent(`config: ${cause.message}`);
+    throw cause;
+  }
+}
+
+/**
+ * Own-property lookup. A plain `record[name]` also finds `constructor`, `toString` and friends
+ * on the prototype, so a vehicle or service NAMED that would resolve to a function.
+ */
+export function own<T>(record: Readonly<Record<string, T>>, name: string): T | undefined {
+  return Object.hasOwn(record, name) ? record[name] : undefined;
 }
 
 /**
@@ -119,7 +142,7 @@ export function serviceOf(
   config: HeistConfig,
   name: string,
 ): { entity: string; price: bigint } {
-  const entry = config.services[name];
+  const entry = own(config.services, name);
   if (entry === undefined) {
     throw new UnknownEntity(name);
   }
@@ -128,7 +151,7 @@ export function serviceOf(
 
 /** Price of a non-service cost as bigint. Throws InvalidIntent for unknown keys. */
 export function priceOf(config: HeistConfig, service: string): bigint {
-  const raw = config.prices[service];
+  const raw = own(config.prices, service);
   if (raw === undefined) {
     throw new InvalidIntent(`No price configured for service "${service}"`);
   }
@@ -137,7 +160,7 @@ export function priceOf(config: HeistConfig, service: string): bigint {
 
 /** Per-minute rental rate of a vehicle as bigint. Throws InvalidIntent for unknown keys. */
 export function rentalRateOf(config: HeistConfig, vehicle: string): bigint {
-  const raw = config.rentalPerMinute[vehicle];
+  const raw = own(config.rentalPerMinute, vehicle);
   if (raw === undefined) {
     throw new InvalidIntent(`No rental rate configured for vehicle "${vehicle}"`);
   }
@@ -260,7 +283,7 @@ export function validateConfig(input: unknown, source = '<inline>'): HeistConfig
       `config (${source}): welcomeGrant must be a decimal string, got ${describe(welcomeGrantRaw)}`,
     );
   }
-  parseAmount(welcomeGrantRaw, 'welcomeGrant'); // validate now, fail loudly here
+  requirePositiveAtLoad(parseAmount(welcomeGrantRaw, 'welcomeGrant'), 'welcomeGrant', source);
   const welcomeGrant = welcomeGrantRaw.trim();
 
   // prices / rentalPerMinute -----------------------------------------------
@@ -334,13 +357,16 @@ function readAmountMap(
     if (key.trim() === '') {
       throw new InvalidIntent(`config (${source}): ${field} has an empty key`);
     }
+    if (key === '__proto__') {
+      throw new InvalidIntent(`config (${source}): ${field} may not use the key "__proto__"`);
+    }
     if (typeof value !== 'string') {
       throw new InvalidIntent(
         `config (${source}): ${field}.${key} must be a decimal string, got ${describe(value)}. ` +
           `Quote money values — JSON numbers are floats.`,
       );
     }
-    parseAmount(value, `${field}.${key}`);
+    requirePositiveAtLoad(parseAmount(value, `${field}.${key}`), `${field}.${key}`, source);
     out[key] = value.trim();
   }
   return out;
@@ -368,6 +394,9 @@ function readServices(
   for (const [key, value] of Object.entries(input)) {
     if (key.trim() === '') {
       throw new InvalidIntent(`config (${source}): services has an empty key`);
+    }
+    if (key === '__proto__') {
+      throw new InvalidIntent(`config (${source}): services may not use the key "__proto__"`);
     }
     if (!isRecord(value)) {
       throw new InvalidIntent(
@@ -398,7 +427,7 @@ function readServices(
           `Quote money values — JSON numbers are floats.`,
       );
     }
-    parseAmount(price, `services.${key}.price`);
+    requirePositiveAtLoad(parseAmount(price, `services.${key}.price`), `services.${key}.price`, source);
 
     out[key] = { entity: entityId, price: price.trim() };
   }
@@ -495,6 +524,13 @@ function readEntities(raw: unknown, source: string): EntityConfig[] {
 // ---------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------
+
+/** A zero price or grant is a config mistake (free everything, or a grant that grants nothing). */
+function requirePositiveAtLoad(amount: bigint, field: string, source: string): void {
+  if (amount <= 0n) {
+    throw new InvalidIntent(`config (${source}): ${field} must be greater than zero, got ${amount.toString()}`);
+  }
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);

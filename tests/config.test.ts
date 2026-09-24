@@ -13,7 +13,9 @@ import {
   TREASURY_ID,
   defaultConfig,
   loadConfig,
+  own,
   parseAmount,
+  parseAmountText,
   priceOf,
   rentalRateOf,
   serviceOf,
@@ -399,5 +401,104 @@ describe('config — admins', () => {
     throwsWithCode(() => validateConfig(withDefaults({ admins: ['a', 'a'] })), 'INVALID_INTENT', 'dup');
     throwsWithCode(() => validateConfig(withDefaults({ admins: ['treasury'] })), 'INVALID_INTENT', 'entity');
     throwsWithCode(() => validateConfig(withDefaults({ admins: ['Treasury'] })), 'INVALID_INTENT', 'entity, other case');
+  });
+});
+
+describe('config — zero is not a price', () => {
+  test('a zero welcomeGrant, price, rental rate or service price is rejected at load', () => {
+    for (const bad of ['0', '0.00', '000']) {
+      throwsWithCode(() => validateConfig(withDefaults({ welcomeGrant: bad })), 'INVALID_INTENT', `grant ${bad}`);
+    }
+    throwsWithCode(
+      () => validateConfig(withDefaults({ prices: { bike_rental: '0' } })),
+      'INVALID_INTENT',
+      'price 0',
+    );
+    throwsWithCode(
+      () => validateConfig(withDefaults({ rentalPerMinute: { bike: '0' } })),
+      'INVALID_INTENT',
+      'rate 0',
+    );
+    throwsWithCode(
+      () => validateConfig(withDefaults({ services: { heal: { entity: 'hospital', price: '0' } } })),
+      'INVALID_INTENT',
+      'service price 0',
+    );
+  });
+
+  test('the error names the field and says why', () => {
+    assert.throws(() => validateConfig(withDefaults({ welcomeGrant: '0' })), /welcomeGrant must be greater than zero/);
+  });
+
+  test('parseAmount itself still parses zero: only the config validators refuse it', () => {
+    assert.equal(parseAmount('0', 'x'), 0n);
+  });
+});
+
+describe('config — lookups only see own keys', () => {
+  test('own() does not find Object.prototype members', () => {
+    const record: Record<string, string> = { bike: '1' };
+    assert.equal(own(record, 'bike'), '1');
+    for (const name of ['constructor', 'toString', 'hasOwnProperty', '__proto__', 'valueOf']) {
+      assert.equal(own(record, name), undefined, name);
+    }
+  });
+
+  test('a service, price or vehicle named like a prototype member is simply unknown', () => {
+    const config = defaultConfig();
+    for (const name of ['constructor', 'toString', '__proto__']) {
+      throwsWithCode(() => serviceOf(config, name), 'UNKNOWN_ENTITY', `service ${name}`);
+      throwsWithCode(() => priceOf(config, name), 'INVALID_INTENT', `price ${name}`);
+      throwsWithCode(() => rentalRateOf(config, name), 'INVALID_INTENT', `rate ${name}`);
+    }
+  });
+
+  test('a "__proto__" key in a map is rejected at load instead of silently dropped', () => {
+    const viaJson = (text: string): unknown => JSON.parse(text);
+    throwsWithCode(
+      () => validateConfig(viaJson('{"prices": {"__proto__": "5"}}')),
+      'INVALID_INTENT',
+      'prices',
+    );
+    throwsWithCode(
+      () => validateConfig(viaJson('{"rentalPerMinute": {"__proto__": "5"}}')),
+      'INVALID_INTENT',
+      'rentalPerMinute',
+    );
+    throwsWithCode(
+      () => validateConfig(viaJson('{"services": {"__proto__": {"entity": "hospital", "price": "5"}}}')),
+      'INVALID_INTENT',
+      'services',
+    );
+  });
+});
+
+describe('parseAmountText — the intent-facing parser', () => {
+  test('failures are INVALID_AMOUNT with no "config:" prefix', () => {
+    for (const bad of ['-1', '1.5', 'abc', '', '1e3', 5, null, undefined, {}]) {
+      assert.throws(
+        () => parseAmountText(bad, 'amount'),
+        (error: unknown) => {
+          assert.ok(error instanceof EngineError);
+          assert.equal(error.code, 'INVALID_AMOUNT', String(bad));
+          assert.doesNotMatch(error.message, /config/i, String(bad));
+          assert.match(error.message, /^amount /);
+          return true;
+        },
+      );
+    }
+  });
+
+  test('accepts the same values parseAmount does, and refuses absurdly long numbers', () => {
+    assert.equal(parseAmountText('500', 'x'), 500n);
+    assert.equal(parseAmountText(' 500.00 ', 'x'), 500n);
+    assert.equal(parseAmountText('9'.repeat(30), 'x'), BigInt('9'.repeat(30)));
+    throwsWithCode(() => parseAmountText('9'.repeat(31), 'x'), 'INVALID_AMOUNT', '31 digits');
+    assert.equal(parseAmountText('0'.repeat(500) + '7', 'x'), 7n, 'leading zeros do not count as digits');
+  });
+
+  test('config parseAmount keeps its "config:" prefix and INVALID_INTENT code', () => {
+    throwsWithCode(() => parseAmount('-1', 'welcomeGrant'), 'INVALID_INTENT', 'negative');
+    assert.throws(() => parseAmount('-1', 'welcomeGrant'), (e: unknown) => (e as Error).message.startsWith('config: welcomeGrant'));
   });
 });

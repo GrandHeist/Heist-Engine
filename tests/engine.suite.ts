@@ -608,6 +608,60 @@ export function engineSuite(factory: BackendFactory): void {
     });
   });
 
+  describe(`EconomyEngine — amounts and lookups [${factory.label}]`, () => {
+    test('a bad intent amount is INVALID_AMOUNT and never mentions config', async () => {
+      await openAccount('player-1');
+      await openAccount('player-2');
+      for (const amount of ['10.5', '-10', 'abc', '', '1e3', '9'.repeat(40)]) {
+        const failure = expectFail(
+          await engine.submit({ type: 'Transfer', nonce: nonce('x'), actor: 'player-1', to: 'player-2', amount }),
+          'INVALID_AMOUNT',
+        );
+        assert.doesNotMatch(failure.message, /config/i, amount);
+        assert.match(failure.message, /^amount /);
+      }
+      // a non-string amount too (the adapter sent a JSON number)
+      const numeric = expectFail(
+        await engine.submit({
+          type: 'Transfer',
+          nonce: nonce('x'),
+          actor: 'player-1',
+          to: 'player-2',
+          amount: 10 as unknown as string,
+        }),
+        'INVALID_AMOUNT',
+      );
+      assert.doesNotMatch(numeric.message, /config/i);
+      assert.equal(await balanceOf('player-1'), WELCOME_GRANT);
+    });
+
+    test('a zero intent amount is rejected as INVALID_AMOUNT', async () => {
+      await openAccount('player-1');
+      await openAccount('player-2');
+      expectFail(
+        await engine.submit({ type: 'Transfer', nonce: nonce('x'), actor: 'player-1', to: 'player-2', amount: '0' }),
+        'INVALID_AMOUNT',
+      );
+    });
+
+    test('vehicle and service names that are Object.prototype members are just unknown names', async () => {
+      await openAccount('player-1');
+      for (const name of ['constructor', 'toString', '__proto__', 'hasOwnProperty']) {
+        // not a configured per-minute vehicle -> the flat fee, exactly like any unlisted vehicle
+        const rented = expectOk(
+          await engine.submit({ type: 'RentVehicle', nonce: nonce('rent'), actor: 'player-1', vehicle: name, minutes: 5 }),
+        );
+        const tx = await backend.getTx(rented.txId);
+        assert.equal(tx?.amount, 10n, `${name} is charged the flat fee, not a config lookup error`);
+
+        expectFail(
+          await engine.submit({ type: 'BuyService', nonce: nonce('svc'), actor: 'player-1', service: name }),
+          'UNKNOWN_ENTITY',
+        );
+      }
+    });
+  });
+
   describe(`EconomyEngine — Theft authorization [${factory.label}]`, () => {
     async function steal(authorizedBy: string, actor = 'robber'): Promise<EngineResponse> {
       return await engine.submit({

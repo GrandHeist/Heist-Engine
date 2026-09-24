@@ -20,28 +20,30 @@ import { randomUUID } from 'node:crypto';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 
-import { defaultConfig } from '../config/config.ts';
+import { fileURLToPath } from 'node:url';
+
+import { loadConfig, validateConfig } from '../config/config.ts';
 import type { HeistConfig } from '../config/config.ts';
 import { EconomyEngine } from '../engine/engine.ts';
 import { Custody } from '../engine/custody.ts';
-import { MemoryBackend } from '../ledger/memory.ts';
-import { SqliteBackend } from '../ledger/sqlite.ts';
-import type { BackendName, Checkpoint, IntegrityReport, LedgerBackend } from '../ledger/backend.ts';
+import { createBackend } from '../ledger/factory.ts';
+import type { Checkpoint, IntegrityReport, LedgerBackend } from '../ledger/backend.ts';
 import type { EngineResponse, Intent, OwnerId, Tx, Wallet } from '../types.ts';
 
 const DEFAULT_DB_PATH = './heist.sqlite';
+/** The checked-in example config, used when --config is not given. */
+const DEFAULT_CONFIG_PATH = fileURLToPath(new URL('../config/heist.config.json', import.meta.url));
 const DEFAULT_HISTORY_LINES = 10;
 const PROMPT = 'heist> ';
 /** Entities `seed` tops up on an empty ledger so payouts and refunds have a source. */
 const DEMO_FUNDED_ENTITIES = ['treasury', 'bike-rental-co', 'taxi-co', 'pd-payroll'];
 const DEMO_FUNDING = '10000';
 
-/** Backends this adapter is allowed to spin up. On-chain is blocked in Custody anyway. */
-type SimBackendName = Extract<BackendName, 'memory' | 'sqlite'>;
-
+/** Command-line overrides. Anything left undefined comes from the config file. */
 interface SimOptions {
-  backend: SimBackendName;
-  dbPath: string;
+  configPath: string;
+  backend?: 'memory' | 'sqlite';
+  dbPath?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -49,29 +51,34 @@ interface SimOptions {
 // ---------------------------------------------------------------------------
 
 function parseArgs(argv: readonly string[]): SimOptions {
-  let backend: SimBackendName = 'memory';
-  let dbPath = DEFAULT_DB_PATH;
+  const options: SimOptions = { configPath: DEFAULT_CONFIG_PATH };
 
   for (const arg of argv) {
-    if (arg.startsWith('--backend=')) {
+    if (arg.startsWith('--config=')) {
+      const value = arg.slice('--config='.length).trim();
+      if (value === '') throw new Error('--config needs a path, e.g. --config=./heist.config.json');
+      options.configPath = value;
+    } else if (arg.startsWith('--backend=')) {
       const value = arg.slice('--backend='.length);
       if (value !== 'memory' && value !== 'sqlite') {
         throw new Error(`--backend must be memory or sqlite, got "${value}"`);
       }
-      backend = value;
+      options.backend = value;
     } else if (arg.startsWith('--db=')) {
       const value = arg.slice('--db='.length).trim();
       if (value === '') throw new Error('--db needs a path, e.g. --db=./heist.sqlite');
-      dbPath = value;
+      options.dbPath = value;
     } else if (arg === '--help' || arg === '-h') {
       process.stdout.write(`${USAGE}\n`);
       process.exit(0);
     } else {
-      throw new Error(`Unknown option "${arg}". Try --backend=memory|sqlite --db=<path>`);
+      throw new Error(
+        `Unknown option "${arg}". Try --config=<path> --backend=memory|sqlite --db=<path>`,
+      );
     }
   }
 
-  return { backend, dbPath };
+  return options;
 }
 
 // ---------------------------------------------------------------------------
@@ -548,14 +555,13 @@ function nonce(): string {
 // Wiring
 // ---------------------------------------------------------------------------
 
+/** The config file, with any command-line overrides applied and the result re-validated. */
 function buildConfig(options: SimOptions): HeistConfig {
-  const config: HeistConfig = { ...defaultConfig(), backend: options.backend };
-  if (options.backend === 'sqlite') config.dbPath = options.dbPath;
-  return config;
-}
-
-function buildBackend(config: HeistConfig, options: SimOptions): LedgerBackend {
-  return options.backend === 'sqlite' ? new SqliteBackend(config.dbPath ?? options.dbPath) : new MemoryBackend();
+  const merged: HeistConfig = { ...loadConfig(options.configPath) };
+  if (options.backend !== undefined) merged.backend = options.backend;
+  if (options.dbPath !== undefined) merged.dbPath = options.dbPath;
+  if (merged.backend === 'sqlite' && merged.dbPath === undefined) merged.dbPath = DEFAULT_DB_PATH;
+  return validateConfig(merged, 'sim options');
 }
 
 async function main(): Promise<number> {
@@ -567,8 +573,15 @@ async function main(): Promise<number> {
     return 2;
   }
 
-  const config = buildConfig(options);
-  const backend = buildBackend(config, options);
+  let config: HeistConfig;
+  let backend: LedgerBackend;
+  try {
+    config = buildConfig(options);
+    backend = createBackend(config);
+  } catch (cause) {
+    out(`startup failed: ${cause instanceof Error ? cause.message : String(cause)}`);
+    return 1;
+  }
   const engine = new EconomyEngine({
     backend,
     custody: new Custody(config.backend),
@@ -584,7 +597,7 @@ async function main(): Promise<number> {
   }
 
   // Verify before serving anything: a ledger that fails is not one to add rows to.
-  const checkpointFile = config.backend === 'sqlite' ? `${config.dbPath ?? options.dbPath}.head` : null;
+  const checkpointFile = config.backend === 'sqlite' ? `${config.dbPath ?? DEFAULT_DB_PATH}.head` : null;
   let saved: Checkpoint | null = null;
   try {
     saved = checkpointFile === null ? null : readCheckpointFile(checkpointFile);

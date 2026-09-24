@@ -33,7 +33,15 @@ import {
   UnknownRental,
   UnknownWallet,
 } from '../errors.ts';
-import { parseAmount, priceOf, rentalRateOf, serviceOf, TREASURY_ID } from '../config/config.ts';
+import {
+  own,
+  parseAmount,
+  parseAmountText,
+  priceOf,
+  rentalRateOf,
+  serviceOf,
+  TREASURY_ID,
+} from '../config/config.ts';
 import type { HeistConfig } from '../config/config.ts';
 import type { LedgerBackend, WalletKeyInfo } from '../ledger/backend.ts';
 import type { Custody } from './custody.ts';
@@ -524,10 +532,10 @@ export class EconomyEngine {
   // -------------------------------------------------------------------------
 
   #rentalCost(vehicle: string, minutes: number): bigint {
-    if (this.#config.rentalPerMinute[vehicle] !== undefined) {
+    if (own(this.#config.rentalPerMinute, vehicle) !== undefined) {
       return rentalRateOf(this.#config, vehicle) * BigInt(minutes);
     }
-    if (this.#config.prices[FLAT_RENTAL_PRICE_KEY] === undefined) {
+    if (own(this.#config.prices, FLAT_RENTAL_PRICE_KEY) === undefined) {
       throw new InvalidIntent(
         `No rental rate configured for vehicle "${vehicle}" and no "${FLAT_RENTAL_PRICE_KEY}" flat price to fall back on`,
       );
@@ -657,10 +665,8 @@ export class EconomyEngine {
 
   /** Parse an amount string off an intent and require it to be strictly positive. */
   #intentAmount(raw: string, field: string): bigint {
-    if (typeof raw !== 'string') {
-      throw new InvalidAmount(`${field} must be a decimal string, e.g. "50"`);
-    }
-    const amount = parseAmount(raw, field);
+    // parseAmountText throws InvalidAmount about the value itself (no "config:" prefix).
+    const amount = parseAmountText(raw, field);
     requirePositive(amount, field);
     return amount;
   }

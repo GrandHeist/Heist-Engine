@@ -3,7 +3,7 @@
 // TypeScript, with no storage layer to hide behind. Tests and the sim run
 // against this; nothing about it may be backend-specific.
 
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 
 import type { Memo, OwnerId, Tx, TxId, TxKind, TxRef, Wallet, WalletId } from '../types.ts';
 import {
@@ -37,15 +37,6 @@ import type { Checkpoint } from './hashchain.ts';
 
 const DEFAULT_HISTORY_LIMIT = 50;
 const MAX_HISTORY_LIMIT = 500;
-
-function sha256Hex(input: string): string {
-  return createHash('sha256').update(input, 'utf8').digest('hex');
-}
-
-/** Public address, derived from the pubkey: `HD` + first 40 hex of sha256(pubkey). */
-export function deriveAddress(pubkey: string): string {
-  return `HD${sha256Hex(pubkey).slice(0, 40)}`;
-}
 
 /** Defensive copy — callers must never be able to mutate ledger state. */
 function cloneTx(tx: Tx): Tx {
