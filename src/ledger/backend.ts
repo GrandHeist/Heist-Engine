@@ -58,6 +58,11 @@ export interface LedgerBackend {
 
   getBalance(id: WalletId): Promise<bigint>;
 
+  /**
+   * All three writes validate the memo (`validateMemo`) and reject an amount that is not a
+   * positive bigint. A `memo.nonce` or `memo.key` that is already used throws DuplicateNonce /
+   * DuplicateKey, atomically with the write.
+   */
   transfer(from: WalletId, to: WalletId, amount: bigint, memo: Memo): Promise<TxRef>;
   /** Admin-only: money enters the world. */
   mint(to: WalletId, amount: bigint, memo: Memo): Promise<TxRef>;
@@ -69,6 +74,8 @@ export interface LedgerBackend {
 
   /** True if this nonce has already settled — the replay guard. */
   hasNonce(nonce: string): Promise<boolean>;
+  /** The tx that consumed this nonce, so a replay can be answered with the original result. */
+  getTxByNonce(nonce: string): Promise<Tx | null>;
 
   /** Walk the whole chain and verify hashes and balances. */
   verifyIntegrity(): Promise<IntegrityReport>;

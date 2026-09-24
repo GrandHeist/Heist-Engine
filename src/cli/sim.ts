@@ -81,7 +81,7 @@ const USAGE = [
   'commands',
   '  join   <player>                    open an account (welcome grant)',
   '  rent   <player> <vehicle> <mins>   rent a vehicle',
-  '  return <player> <vehicle> <mins>   return it, refunding unused minutes',
+  '  return <player> <rental> <mins>    return a rental (tx id or unique prefix from `rent`), refunding unused minutes',
   '  buy    <player> <service> [units]  buy a catalog service',
   '  pay    <employer> <player> <amt>   employer pays a player',
   '  fine   <player> <amt>              player pays the treasury',
@@ -117,7 +117,8 @@ function render(config: HeistConfig, response: EngineResponse): void {
     return;
   }
   out(`  ok ${response.message}`);
-  out(`     balance ${money(config, response.newBalance)}  tx ${response.txId.slice(0, 8)}`);
+  const balance = response.newBalance === null ? '(unavailable)' : money(config, response.newBalance);
+  out(`     balance ${balance}  tx ${response.txId}${response.replayed === true ? '  (replayed)' : ''}`);
 }
 
 function renderTx(config: HeistConfig, tx: Tx, owners: ReadonlyMap<string, string>): void {
@@ -263,12 +264,13 @@ class Simulator {
       }
 
       case 'return': {
-        const usage = 'return <player> <vehicle> <mins>';
+        const usage = 'return <player> <rental> <mins>';
+        const player = arg(args, 0, 'player', usage);
         return await this.#submit({
           type: 'ReturnVehicle',
           nonce: nonce(),
-          actor: arg(args, 0, 'player', usage),
-          vehicle: arg(args, 1, 'vehicle', usage),
+          actor: player,
+          rentalId: await this.#resolveRental(player, arg(args, 1, 'rental', usage)),
           minutesUnused: countArg(args, 2, 'mins', usage),
         });
       }
@@ -393,6 +395,15 @@ class Simulator {
       throw new BadInput(`[UNKNOWN_WALLET] no wallet for "${owner}" — try \`join ${owner}\``);
     }
     return wallet;
+  }
+
+  /** A rental is a tx id; accept a unique prefix of one of the player's recent rentals too. */
+  async #resolveRental(owner: OwnerId, given: string): Promise<string> {
+    const wallet = await this.#requireWallet(owner);
+    const page = await this.#backend.history(wallet.id, undefined, 500);
+    const rentals = page.txs.filter((tx) => tx.memo.intent === 'RentVehicle' && tx.id.startsWith(given));
+    if (rentals.length > 1) throw new BadInput(`"${given}" matches ${rentals.length} rentals; give more of the id`);
+    return rentals[0]?.id ?? given;
   }
 
   async #balance(owner: OwnerId): Promise<void> {

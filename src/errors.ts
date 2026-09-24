@@ -28,6 +28,24 @@ export class DuplicateNonce extends EngineError {
   }
 }
 
+export class DuplicateKey extends EngineError {
+  constructor(key: string) {
+    super('DUPLICATE_KEY', `Ledger key ${key} has already been used`);
+  }
+}
+
+export class UnknownRental extends EngineError {
+  constructor(detail: string) {
+    super('UNKNOWN_RENTAL', detail);
+  }
+}
+
+export class RentalClosed extends EngineError {
+  constructor(rentalId: string) {
+    super('RENTAL_CLOSED', `Rental ${rentalId} has already been returned`);
+  }
+}
+
 export class InvalidIntent extends EngineError {
   constructor(detail: string) {
     super('INVALID_INTENT', detail);

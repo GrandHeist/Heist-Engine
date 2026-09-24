@@ -29,6 +29,7 @@ import type {
   WalletKeyInfo,
 } from './backend.ts';
 import {
+  DuplicateKey,
   DuplicateNonce,
   InsufficientFunds,
   InvalidAmount,
@@ -42,6 +43,7 @@ import {
   decodeAmount,
   encodeAmount,
   hashTx,
+  validateMemo,
   verifyChain,
 } from './hashchain.ts';
 
@@ -80,6 +82,13 @@ CREATE TABLE IF NOT EXISTS balances (
 
 CREATE TABLE IF NOT EXISTS nonces (
   nonce      TEXT PRIMARY KEY,
+  tx_id      TEXT,
+  created_at TEXT
+);
+
+-- Business-object keys (Memo.key): at most one tx per key, enforced by the PRIMARY KEY.
+CREATE TABLE IF NOT EXISTS memo_keys (
+  key        TEXT PRIMARY KEY,
   tx_id      TEXT,
   created_at TEXT
 );
@@ -133,9 +142,11 @@ function isTxKind(value: string): value is TxKind {
 // as null — `exactOptionalPropertyTypes` means `{ detail: undefined }` is not a valid Memo.
 
 function encodeMemo(memo: Memo): string {
-  const out: Record<string, string> = { intent: memo.intent };
+  const out: Record<string, unknown> = { intent: memo.intent };
   if (memo.detail !== undefined) out['detail'] = memo.detail;
   if (memo.nonce !== undefined) out['nonce'] = memo.nonce;
+  if (memo.key !== undefined) out['key'] = memo.key;
+  if (memo.meta !== undefined) out['meta'] = memo.meta;
   return JSON.stringify(out);
 }
 
@@ -159,6 +170,20 @@ function decodeMemo(raw: string): Memo {
   if (typeof detail === 'string') memo.detail = detail;
   const nonce = record['nonce'];
   if (typeof nonce === 'string') memo.nonce = nonce;
+  const key = record['key'];
+  if (typeof key === 'string') memo.key = key;
+  const meta = record['meta'];
+  if (meta !== undefined) {
+    if (typeof meta !== 'object' || meta === null || Array.isArray(meta)) {
+      throw new LedgerCorrupt('Stored memo has a malformed "meta"');
+    }
+    const out: Record<string, string> = {};
+    for (const [k, v] of Object.entries(meta)) {
+      if (typeof v !== 'string') throw new LedgerCorrupt('Stored memo has a non-string meta value');
+      out[k] = v;
+    }
+    memo.meta = out;
+  }
   return memo;
 }
 
@@ -223,7 +248,9 @@ export class SqliteBackend implements LedgerBackend {
     opts?: CreateWalletOptions,
   ): Promise<Wallet> {
     const db = this.database();
-    if (ownerId.length === 0) throw new InvalidIntent('ownerId must not be empty');
+    if (typeof ownerId !== 'string' || ownerId.length === 0) {
+      throw new InvalidIntent('ownerId must be a non-empty string');
+    }
     // A wallet with no pubkey/address is one nothing can ever sign for — see the WalletKeyInfo
     // doc comment in backend.ts. Reject before anything is persisted.
     if (key === null || typeof key !== 'object') {
@@ -236,9 +263,9 @@ export class SqliteBackend implements LedgerBackend {
       throw new InvalidIntent('key.address must be a non-empty string');
     }
 
-    const existing = await this.getWalletByOwner(ownerId);
-    if (existing !== null) return existing;
-
+    // No await between the existence check and the insert: this whole method body is synchronous
+    // from here, so two in-process callers cannot interleave, and BEGIN IMMEDIATE makes a second
+    // process wait for the write lock. ON CONFLICT covers any path that still slips through.
     const wallet: Wallet = {
       id: randomUUID(),
       ownerId,
@@ -250,9 +277,15 @@ export class SqliteBackend implements LedgerBackend {
 
     db.exec('BEGIN IMMEDIATE');
     try {
+      const existingRow = db.prepare('SELECT * FROM wallets WHERE owner_id = ?').get(ownerId);
+      if (existingRow !== undefined) {
+        db.exec('COMMIT');
+        return this.toWallet(existingRow);
+      }
       db.prepare(
         `INSERT INTO wallets (id, owner_id, address, pubkey, is_entity, created_at)
-         VALUES (?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(owner_id) DO NOTHING`,
       ).run(
         wallet.id,
         wallet.ownerId,
@@ -323,21 +356,27 @@ export class SqliteBackend implements LedgerBackend {
     memo: Memo,
   ): TxRef {
     const db = this.database();
+    // Same guards, same codes as MemoryBackend. A JS number that slips through here would be
+    // hashed and stored as text before anything noticed it was not a bigint.
+    if (typeof amount !== 'bigint') {
+      throw new InvalidAmount('Amount must be a bigint of whole HD');
+    }
     if (amount <= 0n) {
       throw new InvalidAmount(`Amount must be positive, got ${amount} HD`);
     }
-    // An empty nonce is not a nonce: stored, it would occupy the nonces PRIMARY KEY once and
-    // make every later empty-nonce write collide as a duplicate. Reject it outright, outside
-    // the transaction, so no rollback is involved.
-    if (memo.nonce !== undefined && memo.nonce.length === 0) {
-      throw new InvalidIntent('memo.nonce must not be empty');
-    }
+    // Includes "an empty nonce is not a nonce": stored, it would occupy the nonces PRIMARY KEY
+    // once and make every later empty-nonce write collide. Rejected outside the transaction.
+    validateMemo(memo);
 
     db.exec('BEGIN IMMEDIATE');
     try {
       const nonce = memo.nonce;
       if (nonce !== undefined && this.nonceExists(nonce)) {
         throw new DuplicateNonce(nonce);
+      }
+      const key = memo.key;
+      if (key !== undefined && this.keyExists(key)) {
+        throw new DuplicateKey(key);
       }
 
       if (from !== null) this.assertWalletExists(from);
@@ -400,6 +439,14 @@ export class SqliteBackend implements LedgerBackend {
         );
       }
 
+      if (key !== undefined) {
+        db.prepare('INSERT INTO memo_keys (key, tx_id, created_at) VALUES (?, ?, ?)').run(
+          key,
+          tx.id,
+          createdAt,
+        );
+      }
+
       db.exec('COMMIT');
       return { txId: tx.id, hash: tx.hash, seq: tx.seq };
     } catch (error) {
@@ -454,6 +501,13 @@ export class SqliteBackend implements LedgerBackend {
 
   async hasNonce(nonce: string): Promise<boolean> {
     return this.nonceExists(nonce);
+  }
+
+  async getTxByNonce(nonce: string): Promise<Tx | null> {
+    const row = this.database()
+      .prepare('SELECT t.* FROM nonces n JOIN transactions t ON t.id = n.tx_id WHERE n.nonce = ?')
+      .get(nonce);
+    return row === undefined ? null : this.toTx(row);
   }
 
   // --- integrity ------------------------------------------------------------
@@ -525,6 +579,10 @@ export class SqliteBackend implements LedgerBackend {
 
   private nonceExists(nonce: string): boolean {
     return this.database().prepare('SELECT 1 FROM nonces WHERE nonce = ?').get(nonce) !== undefined;
+  }
+
+  private keyExists(key: string): boolean {
+    return this.database().prepare('SELECT 1 FROM memo_keys WHERE key = ?').get(key) !== undefined;
   }
 
   private assertWalletExists(id: WalletId): void {

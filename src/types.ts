@@ -26,6 +26,17 @@ export interface Memo {
   detail?: string;
   /** Adapter-supplied idempotency key. Replaying the same one is rejected. */
   nonce?: string;
+  /**
+   * Business-object key: at most ONE tx in the whole ledger may carry a given key, enforced
+   * atomically by the backend like a nonce. Lets the engine say "one welcome grant per owner",
+   * "one refund per rental" without scanning history.
+   */
+  key?: string;
+  /**
+   * Machine-read fields (e.g. a rental's vehicle and minutes). Engine logic reads these and
+   * never parses `detail`, which is display text. Hashed into the chain. See validateMemo.
+   */
+  meta?: Record<string, string>;
 }
 
 export type TxKind = 'transfer' | 'mint' | 'burn';
@@ -89,7 +100,8 @@ export interface RentVehicleIntent extends BaseIntent {
 }
 export interface ReturnVehicleIntent extends BaseIntent {
   type: 'ReturnVehicle';
-  vehicle: string;
+  /** The `txId` that RentVehicle returned. That ledger row IS the rental record. */
+  rentalId: TxId;
   /** Whole minutes left on the rental, used for the partial refund. */
   minutesUnused: number;
 }
@@ -137,8 +149,13 @@ export interface IntentResult {
   ok: true;
   txId: TxId;
   hash: string;
-  /** Balance of the acting player after settlement. */
-  newBalance: bigint;
+  /**
+   * Balance of the acting party after settlement, or null if reading it back failed. The tx
+   * settled either way: an ok result never means "maybe not".
+   */
+  newBalance: bigint | null;
+  /** True when this is the original result of an intent whose nonce was submitted again. */
+  replayed?: boolean;
   /** Human-readable line the adapter can show in-game. */
   message: string;
 }

@@ -190,6 +190,45 @@ describe('canonicalTxPayload', () => {
   });
 });
 
+describe('canonicalTxPayload — memo key and meta', () => {
+  const base: SignableTx = {
+    kind: 'mint',
+    from: null,
+    to: 'w',
+    amount: 5n,
+    memo: { intent: 'Test', nonce: 'n' },
+    prevHash: GENESIS_HASH,
+    seq: 0,
+    createdAt: '2026-07-21T00:00:00.000Z',
+  };
+
+  test('a memo without key or meta hashes exactly as before they existed', () => {
+    assert.ok(!canonicalTxPayload(base).includes('memo.key'));
+    assert.ok(!canonicalTxPayload(base).includes('memo.meta'));
+  });
+
+  test('key and meta change the hash', () => {
+    const plain = computeHash(base);
+    assert.notEqual(computeHash({ ...base, memo: { ...base.memo, key: 'k' } }), plain);
+    assert.notEqual(computeHash({ ...base, memo: { ...base.memo, meta: { a: '1' } } }), plain);
+    assert.notEqual(
+      computeHash({ ...base, memo: { ...base.memo, meta: { a: '1' } } }),
+      computeHash({ ...base, memo: { ...base.memo, meta: { a: '2' } } }),
+    );
+  });
+
+  test('meta is canonical: insertion order does not matter', () => {
+    const one = computeHash({ ...base, memo: { ...base.memo, meta: { a: '1', b: '2' } } });
+    const two = computeHash({ ...base, memo: { ...base.memo, meta: { b: '2', a: '1' } } });
+    assert.equal(one, two);
+  });
+
+  test('meta cannot smuggle a second line into the payload', () => {
+    const payload = canonicalTxPayload({ ...base, memo: { ...base.memo, meta: { a: 'x\nkind="burn"' } } });
+    assert.equal(payload.split('\n').filter((l) => l.startsWith('kind=')).length, 1);
+  });
+});
+
 describe('verifyChain', () => {
   test('accepts an empty chain and a healthy chain', () => {
     assert.deepEqual(verifyChain([]), { ok: true, brokenAt: [] });

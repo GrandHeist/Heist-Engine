@@ -7,6 +7,7 @@ import { createHash, randomUUID } from 'node:crypto';
 
 import type { Memo, OwnerId, Tx, TxId, TxKind, TxRef, Wallet, WalletId } from '../types.ts';
 import {
+  DuplicateKey,
   DuplicateNonce,
   InsufficientFunds,
   InvalidAmount,
@@ -21,7 +22,14 @@ import type {
   LedgerBackend,
   WalletKeyInfo,
 } from './backend.ts';
-import { GENESIS_HASH, canonicalTxPayload, hashTx, verifyChain } from './hashchain.ts';
+import {
+  GENESIS_HASH,
+  canonicalTxPayload,
+  cloneMemo,
+  hashTx,
+  validateMemo,
+  verifyChain,
+} from './hashchain.ts';
 
 const DEFAULT_HISTORY_LIMIT = 50;
 const MAX_HISTORY_LIMIT = 500;
@@ -36,13 +44,6 @@ export function deriveAddress(pubkey: string): string {
 }
 
 /** Defensive copy — callers must never be able to mutate ledger state. */
-function cloneMemo(memo: Memo): Memo {
-  const out: Memo = { intent: memo.intent };
-  if (memo.detail !== undefined) out.detail = memo.detail;
-  if (memo.nonce !== undefined) out.nonce = memo.nonce;
-  return out;
-}
-
 function cloneTx(tx: Tx): Tx {
   return { ...tx, memo: cloneMemo(tx.memo) };
 }
@@ -98,7 +99,9 @@ export class MemoryBackend implements LedgerBackend {
   private readonly balances = new Map<WalletId, bigint>();
   private readonly txs: Tx[] = [];
   private readonly txsById = new Map<TxId, Tx>();
-  private readonly nonces = new Set<string>();
+  /** nonce -> id of the tx that consumed it. */
+  private readonly nonces = new Map<string, TxId>();
+  private readonly keys = new Set<string>();
 
   // No storage to provision and no handles to release, but the interface is the
   // contract: callers call these regardless of which backend they hold.
@@ -241,6 +244,11 @@ export class MemoryBackend implements LedgerBackend {
     return this.nonces.has(nonce);
   }
 
+  async getTxByNonce(nonce: string): Promise<Tx | null> {
+    const id = this.nonces.get(nonce);
+    return id === undefined ? null : await this.getTx(id);
+  }
+
   // -------------------------------------------------------------------------
   // Integrity
   // -------------------------------------------------------------------------
@@ -292,11 +300,11 @@ export class MemoryBackend implements LedgerBackend {
       throw new InvalidAmount(`Amount must be greater than zero, got ${String(amount)} HD`);
     }
 
+    validateMemo(memo);
     const nonce = memo.nonce;
-    if (nonce !== undefined) {
-      if (nonce.length === 0) throw new InvalidIntent('memo.nonce must not be empty');
-      if (this.nonces.has(nonce)) throw new DuplicateNonce(nonce);
-    }
+    if (nonce !== undefined && this.nonces.has(nonce)) throw new DuplicateNonce(nonce);
+    const key = memo.key;
+    if (key !== undefined && this.keys.has(key)) throw new DuplicateKey(key);
 
     // Debit side must be able to cover it. Mint has no debit side.
     if (from !== null) {
@@ -334,7 +342,8 @@ export class MemoryBackend implements LedgerBackend {
     // synchronous, so there is no window where a caller can observe a half-write.
     this.txs.push(tx);
     this.txsById.set(tx.id, tx);
-    if (nonce !== undefined) this.nonces.add(nonce);
+    if (nonce !== undefined) this.nonces.set(nonce, tx.id);
+    if (key !== undefined) this.keys.add(key);
     if (from !== null) this.balances.set(from, (this.balances.get(from) ?? 0n) - amount);
     if (to !== null) this.balances.set(to, (this.balances.get(to) ?? 0n) + amount);
 

@@ -8,6 +8,7 @@ import assert from 'node:assert/strict';
 import { defaultConfig, TREASURY_ID } from '../src/config/config.ts';
 import { Custody } from '../src/engine/custody.ts';
 import { EconomyEngine } from '../src/engine/engine.ts';
+import { LedgerCorrupt } from '../src/errors.ts';
 import { MemoryBackend } from '../src/ledger/memory.ts';
 import type { EngineResponse, Intent, IntentFailure, IntentResult } from '../src/types.ts';
 
@@ -23,6 +24,8 @@ let backend: MemoryBackend;
 let custody: Custody;
 let engine: EconomyEngine;
 let nonceCounter = 0;
+/** Causes the engine hid from the adapter, per test. */
+let internalErrors: unknown[] = [];
 
 function nonce(tag: string): string {
   nonceCounter += 1;
@@ -64,10 +67,33 @@ async function openAccount(actor: string): Promise<IntentResult> {
   return expectOk(await engine.submit({ type: 'OpenAccount', nonce: nonce('open'), actor }));
 }
 
+/** Rent and return the rental id — the RentVehicle tx id, which is what ReturnVehicle names. */
+async function rent(actor: string, vehicle: string, minutes: number): Promise<string> {
+  return expectOk(
+    await engine.submit({ type: 'RentVehicle', nonce: nonce('rent'), actor, vehicle, minutes }),
+  ).txId;
+}
+
+function giveBack(actor: string, rentalId: string, minutesUnused: number): Promise<EngineResponse> {
+  return engine.submit({
+    type: 'ReturnVehicle',
+    nonce: nonce('return'),
+    actor,
+    rentalId,
+    minutesUnused,
+  });
+}
+
 beforeEach(async () => {
+  internalErrors = [];
   backend = new MemoryBackend();
   custody = new Custody('memory');
-  engine = new EconomyEngine({ backend, custody, config: testConfig() });
+  engine = new EconomyEngine({
+    backend,
+    custody,
+    config: testConfig(),
+    onInternalError: (cause) => internalErrors.push(cause),
+  });
   await engine.init();
 });
 
@@ -141,23 +167,9 @@ describe('EconomyEngine — happy paths for all 8 intents', () => {
 
   test('ReturnVehicle refunds the unused minutes from the rental entity', async () => {
     await openAccount('player-1');
-    await engine.submit({
-      type: 'RentVehicle',
-      nonce: nonce('rent'),
-      actor: 'player-1',
-      vehicle: 'bike',
-      minutes: 30,
-    });
+    const rentalId = await rent('player-1', 'bike', 30);
 
-    const result = expectOk(
-      await engine.submit({
-        type: 'ReturnVehicle',
-        nonce: nonce('return'),
-        actor: 'player-1',
-        vehicle: 'bike',
-        minutesUnused: 10,
-      }),
-    );
+    const result = expectOk(await giveBack('player-1', rentalId, 10));
 
     assert.equal(result.newBalance, WELCOME_GRANT - 30n + 10n);
     assert.equal(await balanceOf(RENTAL_ENTITY), 20n);
@@ -167,30 +179,17 @@ describe('EconomyEngine — happy paths for all 8 intents', () => {
     assert.equal(tx?.memo.intent, 'ReturnVehicle');
   });
 
-  test('ReturnVehicle never refunds more than was paid for that vehicle', async () => {
+  test('ReturnVehicle rejects more unused minutes than were rented, and moves nothing', async () => {
     await openAccount('player-1');
     await fundEntity(RENTAL_ENTITY, 10_000n);
+    const rentalId = await rent('player-1', 'bike', 10);
 
-    await engine.submit({
-      type: 'RentVehicle',
-      nonce: nonce('rent'),
-      actor: 'player-1',
-      vehicle: 'bike',
-      minutes: 10,
-    });
+    expectFail(await giveBack('player-1', rentalId, 999), 'INVALID_INTENT');
+    assert.equal(await balanceOf('player-1'), WELCOME_GRANT - 10n);
 
-    // Claim 999 unused minutes against a 10-minute rental.
-    const result = expectOk(
-      await engine.submit({
-        type: 'ReturnVehicle',
-        nonce: nonce('return'),
-        actor: 'player-1',
-        vehicle: 'bike',
-        minutesUnused: 999,
-      }),
-    );
-
-    assert.equal(result.newBalance, WELCOME_GRANT, 'refund must be capped at what was paid');
+    // The rental is still open: a truthful return works afterwards.
+    expectOk(await giveBack('player-1', rentalId, 10));
+    assert.equal(await balanceOf('player-1'), WELCOME_GRANT);
   });
 
   test('BuyService pays the configured entity price * units', async () => {
@@ -326,28 +325,96 @@ describe('EconomyEngine — concurrency', () => {
   test('concurrent ReturnVehicle intents cannot double-refund one rental', async () => {
     await openAccount('player-1');
     await fundEntity(RENTAL_ENTITY, 10_000n);
-    await engine.submit({
-      type: 'RentVehicle',
-      nonce: nonce('rent'),
-      actor: 'player-1',
-      vehicle: 'bike',
-      minutes: 10,
-    });
+    const rentalId = await rent('player-1', 'bike', 10);
 
-    const returns = await Promise.all(
-      [1, 2, 3].map(() =>
-        engine.submit({
-          type: 'ReturnVehicle',
-          nonce: nonce('return'),
-          actor: 'player-1',
-          vehicle: 'bike',
-          minutesUnused: 10,
-        }),
-      ),
-    );
+    const returns = await Promise.all([1, 2, 3].map(() => giveBack('player-1', rentalId, 10)));
 
     assert.equal(returns.filter((r) => r.ok).length, 1, 'exactly one refund may settle');
+    for (const r of returns.filter((r) => !r.ok)) assert.equal(r.code, 'RENTAL_CLOSED');
     assert.equal(await balanceOf('player-1'), WELCOME_GRANT, 'rented 10, refunded 10, once');
+  });
+});
+
+describe('EconomyEngine — rentals are explicit records', () => {
+  test('a rental is returned once', async () => {
+    await openAccount('player-1');
+    const rentalId = await rent('player-1', 'bike', 30);
+    expectOk(await giveBack('player-1', rentalId, 10));
+    expectFail(await giveBack('player-1', rentalId, 10), 'RENTAL_CLOSED');
+    assert.equal(await balanceOf('player-1'), WELCOME_GRANT - 20n);
+  });
+
+  test('a flat-fee vehicle is refunded pro rata, not the whole fee', async () => {
+    await openAccount('player-1');
+    const rentalId = await rent('player-1', 'scooter', 60); // no per-minute rate: flat 10 HD
+    assert.equal(await balanceOf('player-1'), WELCOME_GRANT - 10n);
+
+    const refund = expectOk(await giveBack('player-1', rentalId, 30));
+    assert.equal(refund.newBalance, WELCOME_GRANT - 5n, '30 of 60 minutes unused -> half of 10');
+  });
+
+  test('a refund too small to be a whole HD is rejected and leaves the rental open', async () => {
+    await openAccount('player-1');
+    const rentalId = await rent('player-1', 'scooter', 60);
+    expectFail(await giveBack('player-1', rentalId, 1), 'INVALID_AMOUNT'); // 10 * 1 / 60 = 0
+    expectOk(await giveBack('player-1', rentalId, 6));
+  });
+
+  test('the refund is at the price actually paid, not today\'s config', async () => {
+    await openAccount('player-1');
+    const rentalId = await rent('player-1', 'bike', 30); // paid 30 at 1 HD/min
+
+    const repriced = { ...testConfig(), rentalPerMinute: { ...testConfig().rentalPerMinute, bike: '5' } };
+    const later = new EconomyEngine({ backend, custody, config: repriced });
+    await later.init();
+    const result = await later.submit({
+      type: 'ReturnVehicle',
+      nonce: nonce('return'),
+      actor: 'player-1',
+      rentalId,
+      minutesUnused: 10,
+    });
+    assert.equal(expectOk(result).newBalance, WELCOME_GRANT - 20n, 'refund is 10, not 5 * 10');
+  });
+
+  test('only the renter can return it, and only a real RentVehicle tx counts', async () => {
+    await openAccount('player-1');
+    await openAccount('player-2');
+    const rentalId = await rent('player-1', 'bike', 30);
+    const grant = expectOk(await engine.submit({ type: 'OpenAccount', nonce: nonce('o'), actor: 'player-3' }));
+
+    expectFail(await giveBack('player-2', rentalId, 10), 'UNKNOWN_RENTAL'); // someone else's
+    expectFail(await giveBack('player-1', grant.txId, 10), 'UNKNOWN_RENTAL'); // not a rental
+    expectFail(await giveBack('player-1', 'no-such-tx', 10), 'UNKNOWN_RENTAL');
+    assert.equal(await balanceOf('player-2'), WELCOME_GRANT);
+    assert.equal(await balanceOf('player-1'), WELCOME_GRANT - 30n);
+  });
+
+  test('memo text is never read: a payment that only looks like a rental is not one', async () => {
+    await openAccount('player-1');
+    await fundEntity(RENTAL_ENTITY, 1000n);
+    const player = await backend.getWalletByOwner('player-1');
+    const entity = await backend.getWalletByOwner(RENTAL_ENTITY);
+    assert.ok(player !== null && entity !== null);
+    const fake = await backend.transfer(player.id, entity.id, 100n, {
+      intent: 'RentVehicle',
+      detail: 'bike — 100min',
+      nonce: nonce('fake'),
+    });
+    expectFail(await giveBack('player-1', fake.txId, 100), 'UNKNOWN_RENTAL');
+  });
+
+  test('a refund the rental entity cannot cover fails and leaves the rental open', async () => {
+    await openAccount('player-1');
+    const rentalId = await rent('player-1', 'bike', 30);
+    // Drain the entity through the (test-only) backend so it cannot pay back.
+    const entity = await backend.getWalletByOwner(RENTAL_ENTITY);
+    assert.ok(entity !== null);
+    await backend.burn(entity.id, 30n, { intent: 'TestDrain', nonce: nonce('drain') });
+
+    expectFail(await giveBack('player-1', rentalId, 10), 'INSUFFICIENT_FUNDS');
+    await fundEntity(RENTAL_ENTITY, 30n);
+    expectOk(await giveBack('player-1', rentalId, 10));
   });
 });
 
@@ -414,7 +481,7 @@ describe('EconomyEngine — entity ids are not players', () => {
     return [
       { type: 'OpenAccount', nonce: nonce('e'), actor: id },
       { type: 'RentVehicle', nonce: nonce('e'), actor: id, vehicle: 'bike', minutes: 5 },
-      { type: 'ReturnVehicle', nonce: nonce('e'), actor: id, vehicle: 'bike', minutesUnused: 5 },
+      { type: 'ReturnVehicle', nonce: nonce('e'), actor: id, rentalId: 'x', minutesUnused: 5 },
       { type: 'BuyService', nonce: nonce('e'), actor: id, service: 'hospital_full_heal' },
       { type: 'Payout', nonce: nonce('e'), actor: id, employer: 'pd-payroll', amount: '50' },
       { type: 'Fine', nonce: nonce('e'), actor: id, amount: '50' },
@@ -559,9 +626,10 @@ describe('EconomyEngine — admin funding', () => {
     assert.equal(await balanceOf('player-1'), WELCOME_GRANT);
   });
 
-  test('is replay-protected and validates the amount', async () => {
+  test('is replay-protected (never funds twice) and validates the amount', async () => {
     expectOk(await engine.fundEntity('treasury', '100', 'fund-once'));
-    expectFail(await engine.fundEntity('treasury', '100', 'fund-once'), 'DUPLICATE_NONCE');
+    expectOk(await engine.fundEntity('treasury', '100', 'fund-once')); // replay: original result
+    expectFail(await engine.fundEntity('hospital', '100', 'fund-once'), 'DUPLICATE_NONCE'); // reuse
     for (const amount of ['0', '-5', '1.5', 'abc', '']) {
       assert.equal((await engine.fundEntity('treasury', amount, nonce('fund'))).ok, false, amount);
     }
@@ -570,21 +638,50 @@ describe('EconomyEngine — admin funding', () => {
 });
 
 describe('EconomyEngine — replay protection', () => {
-  test('a replayed OpenAccount nonce does not double-grant', async () => {
+  test('a replayed OpenAccount nonce returns the original result and does not double-grant', async () => {
     const first = expectOk(
       await engine.submit({ type: 'OpenAccount', nonce: 'fixed-nonce', actor: 'player-1' }),
     );
     assert.equal(first.newBalance, WELCOME_GRANT);
+    assert.equal(first.replayed, undefined);
 
-    const replay = await engine.submit({
-      type: 'OpenAccount',
-      nonce: 'fixed-nonce',
-      actor: 'player-1',
-    });
-    expectFail(replay, 'DUPLICATE_NONCE');
+    const replay = expectOk(
+      await engine.submit({ type: 'OpenAccount', nonce: 'fixed-nonce', actor: 'player-1' }),
+    );
+    assert.equal(replay.txId, first.txId, 'the adapter gets the original tx back');
+    assert.equal(replay.hash, first.hash);
+    assert.equal(replay.replayed, true);
 
     assert.equal(await balanceOf('player-1'), WELCOME_GRANT, 'the grant must not be paid twice');
     assert.equal((await backend.listWallets()).filter((w) => !w.isEntity).length, 1);
+  });
+
+  test('a replayed Transfer, Payout and Theft each return their original tx once', async () => {
+    await openAccount('player-1');
+    await openAccount('player-2');
+    await engine.fundEntity('pd-payroll', '1000', nonce('fund'));
+
+    const intents: Intent[] = [
+      { type: 'Transfer', nonce: 'r-xfer', actor: 'player-1', to: 'player-2', amount: '10' },
+      { type: 'Payout', nonce: 'r-pay', actor: 'player-1', employer: 'pd-payroll', amount: '20' },
+      { type: 'Theft', nonce: 'r-theft', actor: 'player-1', victim: 'player-2', amount: '30', authorizedBy: 'player-2' },
+    ];
+    for (const intent of intents) {
+      const first = expectOk(await engine.submit(intent));
+      const again = expectOk(await engine.submit(intent));
+      assert.equal(again.txId, first.txId, intent.type);
+      assert.equal(again.replayed, true);
+    }
+    assert.equal(await balanceOf('player-1'), WELCOME_GRANT - 10n + 20n + 30n);
+    assert.equal(await balanceOf('player-2'), WELCOME_GRANT + 10n - 30n);
+  });
+
+  test('a replayed admin funding returns the original tx', async () => {
+    const first = expectOk(await engine.fundEntity('treasury', '100', 'fund-once'));
+    const again = expectOk(await engine.fundEntity('treasury', '100', 'fund-once'));
+    assert.equal(again.txId, first.txId);
+    assert.equal(again.replayed, true);
+    assert.equal(await balanceOf('treasury'), 100n);
   });
 
   test('a replayed nonce from a different actor is still rejected', async () => {
@@ -601,6 +698,7 @@ describe('EconomyEngine — replay protection', () => {
       }),
     );
 
+    // player-2 is the RECIPIENT of the settled tx; that does not make them its initiator.
     expectFail(
       await engine.submit({
         type: 'Transfer',
@@ -614,6 +712,19 @@ describe('EconomyEngine — replay protection', () => {
 
     assert.equal(await balanceOf('player-1'), WELCOME_GRANT - 10n);
     assert.equal(await balanceOf('player-2'), WELCOME_GRANT + 10n);
+  });
+
+  test('a nonce reused for a different intent type is rejected, not answered', async () => {
+    await openAccount('player-1');
+    await openAccount('player-2');
+    expectOk(
+      await engine.submit({ type: 'Transfer', nonce: 'reused', actor: 'player-1', to: 'player-2', amount: '10' }),
+    );
+    expectFail(
+      await engine.submit({ type: 'Fine', nonce: 'reused', actor: 'player-1', amount: '10' }),
+      'DUPLICATE_NONCE',
+    );
+    assert.equal(await balanceOf('player-1'), WELCOME_GRANT - 10n);
   });
 });
 
@@ -808,16 +919,17 @@ describe('EconomyEngine — submit never throws', () => {
         type: 'ReturnVehicle',
         nonce: nonce('x'),
         actor: 'player-1',
-        vehicle: 'bike',
+        rentalId: 'r',
         minutesUnused: -1,
       },
       {
         type: 'ReturnVehicle',
         nonce: nonce('x'),
         actor: 'player-1',
-        vehicle: 'bike',
+        rentalId: 'never-rented',
         minutesUnused: 5,
       },
+      { type: 'ReturnVehicle', nonce: nonce('x'), actor: 'player-1', minutesUnused: 5 },
     ];
 
     for (const candidate of garbage) {
@@ -846,19 +958,20 @@ describe('EconomyEngine — submit never throws', () => {
     assert.equal(await balanceOf('player-1'), WELCOME_GRANT);
   });
 
-  test('a backend that throws unexpectedly becomes code INTERNAL, not a rejection', async () => {
-    const boom = new Error('disk on fire');
+  test('an unexpected backend error becomes INTERNAL and its message never reaches the adapter', async () => {
+    const seen: { cause: unknown; ref: string }[] = [];
     const brokenBackend = new MemoryBackend();
     const brokenEngine = new EconomyEngine({
       backend: brokenBackend,
       custody: new Custody('memory'),
       config: defaultConfig(),
+      onInternalError: (cause, ref) => seen.push({ cause, ref }),
     });
     await brokenEngine.init();
 
     // A non-EngineError escaping the backend must still be caught by submit().
     brokenBackend.mint = async () => {
-      throw boom;
+      throw new Error('SQLITE_ERROR: no such column secret_col in table wallets');
     };
 
     const response = await brokenEngine.submit({
@@ -867,6 +980,68 @@ describe('EconomyEngine — submit never throws', () => {
       actor: 'player-1',
     });
     expectFail(response, 'INTERNAL');
-    assert.equal(response.message, 'disk on fire');
+    assert.doesNotMatch(response.message, /SQLITE|secret_col|wallets/);
+    assert.equal(seen.length, 1, 'the real cause is handed to the operator hook');
+    assert.match(String(seen[0]?.cause), /secret_col/);
+    assert.ok(response.message.includes(seen[0]?.ref ?? 'missing'), 'the ref ties the two together');
+  });
+
+  test('ledger corruption is reported with its own code but a generic message', async () => {
+    const brokenBackend = new MemoryBackend();
+    const brokenEngine = new EconomyEngine({
+      backend: brokenBackend,
+      custody: new Custody('memory'),
+      config: defaultConfig(),
+      onInternalError: () => undefined,
+    });
+    await brokenEngine.init();
+    brokenBackend.mint = async () => {
+      throw new LedgerCorrupt('Column "amount" is not TEXT (got number)');
+    };
+    const response = await brokenEngine.submit({ type: 'OpenAccount', nonce: 'c-1', actor: 'player-1' });
+    expectFail(response, 'LEDGER_CORRUPT');
+    assert.doesNotMatch(response.message, /Column|TEXT/);
+  });
+
+  test('a throwing operator hook cannot turn a typed failure into an exception', async () => {
+    const brokenBackend = new MemoryBackend();
+    const brokenEngine = new EconomyEngine({
+      backend: brokenBackend,
+      custody: new Custody('memory'),
+      config: defaultConfig(),
+      onInternalError: () => {
+        throw new Error('logger down');
+      },
+    });
+    await brokenEngine.init();
+    brokenBackend.mint = async () => {
+      throw new Error('boom');
+    };
+    expectFail(await brokenEngine.submit({ type: 'OpenAccount', nonce: 'h-1', actor: 'p' }), 'INTERNAL');
+  });
+
+  test('a failed balance read-back after settlement is still ok:true, with a null balance', async () => {
+    await openAccount('player-1');
+    await openAccount('player-2');
+    let reads = 0;
+    backend.getBalance = async () => {
+      reads += 1;
+      throw new Error('read replica gone');
+    };
+    const response = expectOk(
+      await engine.submit({
+        type: 'Transfer',
+        nonce: nonce('xfer'),
+        actor: 'player-1',
+        to: 'player-2',
+        amount: '10',
+      }),
+    );
+    assert.equal(response.newBalance, null);
+    assert.ok(reads > 0);
+    assert.equal(internalErrors.length, 1, 'the failed read is logged, not swallowed');
+    // the money did move
+    const tx = await backend.getTx(response.txId);
+    assert.equal(tx?.amount, 10n);
   });
 });

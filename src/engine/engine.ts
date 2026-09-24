@@ -17,15 +17,20 @@
 //     keep its own nonce set.
 // ===========================================================================
 
+import { randomUUID } from 'node:crypto';
+
 import {
   AccountExists,
+  DuplicateKey,
   DuplicateNonce,
   EngineError,
-  InsufficientFunds,
   InvalidAmount,
   InvalidIntent,
+  LedgerCorrupt,
   NotAuthorized,
+  RentalClosed,
   UnknownEntity,
+  UnknownRental,
   UnknownWallet,
 } from '../errors.ts';
 import { parseAmount, priceOf, rentalRateOf, serviceOf, TREASURY_ID } from '../config/config.ts';
@@ -47,6 +52,7 @@ import type {
   ReturnVehicleIntent,
   TheftIntent,
   TransferIntent,
+  Tx,
   Wallet,
   WalletId,
 } from '../types.ts';
@@ -57,20 +63,48 @@ const RENTAL_ENTITY: OwnerId = 'bike-rental-co';
 /** Price key used when a vehicle has no per-minute rate — a flat rental fee. */
 const FLAT_RENTAL_PRICE_KEY = 'bike_rental';
 
-/** History page size and page cap used when reconstructing what a rental cost. */
-const HISTORY_PAGE_SIZE = 200;
-const HISTORY_MAX_PAGES = 50;
+/**
+ * Error codes whose message is written for the adapter and safe to show a player. Every other
+ * failure is reported generically; the detail (SQL, column names, stored rows) goes to the log.
+ */
+const PUBLIC_CODES: ReadonlySet<string> = new Set([
+  'INSUFFICIENT_FUNDS',
+  'UNKNOWN_WALLET',
+  'DUPLICATE_NONCE',
+  'INVALID_INTENT',
+  'INVALID_AMOUNT',
+  'UNKNOWN_ENTITY',
+  'NOT_AUTHORIZED',
+  'ACCOUNT_EXISTS',
+  'UNKNOWN_RENTAL',
+  'RENTAL_CLOSED',
+]);
+
+/** For a replayed nonce: which side of the tx is the party that initiated that intent type. */
+const INITIATOR_IS_RECIPIENT: ReadonlySet<string> = new Set([
+  'OpenAccount',
+  'ReturnVehicle',
+  'Payout',
+  'Theft',
+]);
 
 export interface EconomyEngineOptions {
   backend: LedgerBackend;
   custody: Custody;
   config: HeistConfig;
+  /**
+   * Called with the real cause of any failure the adapter is not shown (unexpected errors,
+   * ledger corruption). `ref` is the short id included in the adapter-facing message so an
+   * operator can match the two. Defaults to console.error.
+   */
+  onInternalError?: (cause: unknown, ref: string) => void;
 }
 
 export class EconomyEngine {
   readonly #backend: LedgerBackend;
   readonly #custody: Custody;
   readonly #config: HeistConfig;
+  readonly #onInternalError: (cause: unknown, ref: string) => void;
   /** entity id -> display name, built once from config. */
   readonly #entities: Map<OwnerId, string>;
   /** Lower-cased entity ids. Player ids may not collide with these, whatever the casing. */
@@ -83,6 +117,9 @@ export class EconomyEngine {
     this.#backend = options.backend;
     this.#custody = options.custody;
     this.#config = options.config;
+    this.#onInternalError =
+      options.onInternalError ??
+      ((cause, ref) => console.error(`[heist-engine] internal error ${ref}:`, cause));
     this.#entities = new Map(options.config.entities.map((e) => [e.id, e.name ?? e.id]));
     this.#entityKeys = new Set(options.config.entities.map((e) => e.id.toLowerCase()));
     this.#admins = new Set(options.config.admins);
@@ -134,9 +171,15 @@ export class EconomyEngine {
     return await this.#guarded(async () => {
       assertNonEmpty(nonce, 'nonce');
       assertNonEmpty(entityId, 'entityId');
-      if (await this.#backend.hasNonce(nonce)) throw new DuplicateNonce(nonce);
-      const value = this.#intentAmount(amount, 'amount');
       const entity = await this.#requireEntityWallet(entityId);
+      const prior = await this.#backend.getTxByNonce(nonce);
+      if (prior !== null) {
+        if (prior.memo.intent === 'AdminFund' && prior.to === entity.id) {
+          return await this.#replayed(prior, entity.id);
+        }
+        throw new DuplicateNonce(nonce);
+      }
+      const value = this.#intentAmount(amount, 'amount');
       const ref = await this.#backend.mint(entity.id, value, {
         intent: 'AdminFund',
         detail: `admin funding of ${this.#displayName(entityId)}`,
@@ -151,13 +194,21 @@ export class EconomyEngine {
     try {
       return await this.#lock.run(work);
     } catch (cause) {
-      if (cause instanceof EngineError) {
+      if (cause instanceof EngineError && PUBLIC_CODES.has(cause.code)) {
         return { ok: false, code: cause.code, message: cause.message };
+      }
+      // Anything else may carry SQL, column names or stored rows. Log it, tell the adapter
+      // only that it happened and how to find it.
+      const ref = randomUUID().slice(0, 8);
+      try {
+        this.#onInternalError(cause, ref);
+      } catch {
+        // a broken logger must not turn a typed failure into a throw
       }
       return {
         ok: false,
-        code: 'INTERNAL',
-        message: cause instanceof Error ? cause.message : String(cause),
+        code: cause instanceof LedgerCorrupt ? 'LEDGER_CORRUPT' : 'INTERNAL',
+        message: `Internal error (ref ${ref}). The server log has the details.`,
       };
     }
   }
@@ -174,9 +225,17 @@ export class EconomyEngine {
     assertNonEmpty(intent.actor, 'actor');
 
     // Ask the backend — the single source of truth for replay — before doing any
-    // work that has a side effect (OpenAccount would otherwise create a wallet on
-    // a replay before the settle call rejected it). The backend still enforces.
-    if (await this.#backend.hasNonce(intent.nonce)) {
+    // work that has a side effect. The backend still enforces atomically at write time.
+    // A retry of an intent that already settled (same nonce, same type, same initiator) gets
+    // the ORIGINAL result back so the adapter can carry on; any other reuse is a duplicate.
+    const prior = await this.#backend.getTxByNonce(intent.nonce);
+    if (prior !== null) {
+      const initiator = INITIATOR_IS_RECIPIENT.has(prior.memo.intent) ? prior.to : prior.from;
+      const actor =
+        typeof intent.actor === 'string' ? await this.#backend.getWalletByOwner(intent.actor) : null;
+      if (actor !== null && initiator === actor.id && prior.memo.intent === intent.type) {
+        return await this.#replayed(prior, actor.id);
+      }
       throw new DuplicateNonce(intent.nonce);
     }
 
@@ -209,13 +268,10 @@ export class EconomyEngine {
   /**
    * Open an account and pay the welcome grant — once per owner.
    *
-   * The grant is a MINT, attributed to the treasury in the memo. The ledger records no source
-   * wallet for a mint ("treasury authority signs", types.ts), and treasury balance is fines
-   * revenue, not a supply pot; docs/adr/0004 explains why the grant is not a treasury transfer.
-   *
-   * A wallet that already has ledger history has had its grant. A wallet with none is an
-   * interrupted open (wallet written, mint not) and is completed rather than left grantless.
-   * Concurrent calls are serialized by the engine lock, so the check below cannot race.
+   * The grant is a MINT, attributed to the treasury in the memo (docs/adr/0004 explains why it
+   * is not a treasury transfer). "Once" is enforced by the ledger, not by a check here: the mint
+   * carries the key `welcome:<owner>` and a backend accepts a given key exactly once, atomically.
+   * A wallet written without its mint (interrupted open) simply gets the grant on the next call.
    */
   async #openAccount(intent: OpenAccountIntent): Promise<IntentResult> {
     this.#requireEntity(TREASURY_ID);
@@ -224,18 +280,19 @@ export class EconomyEngine {
 
     this.#assertPlayerId(intent.actor, 'actor');
     const existing = await this.#backend.getWalletByOwner(intent.actor);
-    if (existing !== null) {
-      if (existing.isEntity) throw new NotAuthorized(`"${intent.actor}" is an entity account`);
-      const history = await this.#backend.history(existing.id, undefined, 1);
-      if (history.txs.length > 0) throw new AccountExists(intent.actor, existing.address);
-    }
+    if (existing?.isEntity === true) throw new NotAuthorized(`"${intent.actor}" is an entity account`);
     const player = existing ?? (await this.#ensureWallet(intent.actor, false));
 
-    const ref = await this.#backend.mint(
-      player.id,
-      amount,
-      this.#memo(intent, `welcome grant from ${this.#displayName(TREASURY_ID)}`),
-    );
+    let ref;
+    try {
+      ref = await this.#backend.mint(player.id, amount, {
+        ...this.#memo(intent, `welcome grant from ${this.#displayName(TREASURY_ID)}`),
+        key: `welcome:${intent.actor}`,
+      });
+    } catch (cause) {
+      if (cause instanceof DuplicateKey) throw new AccountExists(intent.actor, player.address);
+      throw cause;
+    }
 
     return await this.#result(
       ref,
@@ -259,7 +316,11 @@ export class EconomyEngine {
       player.id,
       payee.id,
       amount,
-      this.#memo(intent, `${intent.vehicle} — ${minutes}min`),
+      {
+        ...this.#memo(intent, `${intent.vehicle} — ${minutes}min`),
+        // The rental record: ReturnVehicle reads these, never the detail text.
+        meta: { vehicle: intent.vehicle, minutes: String(minutes) },
+      },
     );
 
     return await this.#result(
@@ -269,44 +330,46 @@ export class EconomyEngine {
     );
   }
 
-  /** bike-rental-co -> player, refunding the unused portion of a rental. */
+  /**
+   * bike-rental-co -> player, refunding the unused portion of ONE rental.
+   *
+   * The rental is the RentVehicle tx named by `rentalId`: its amount is what was actually paid
+   * and its `meta` holds the minutes rented, so the refund is `paid * unused / rented` whatever
+   * the config says today, and never more than was paid. A rental is returned once: the refund
+   * carries the key `return:<rentalId>`, which the ledger accepts a single time, atomically.
+   */
   async #returnVehicle(intent: ReturnVehicleIntent): Promise<IntentResult> {
-    assertNonEmpty(intent.vehicle, 'vehicle');
+    assertNonEmpty(intent.rentalId, 'rentalId');
     const minutesUnused = requireWholeCount(intent.minutesUnused, 'minutesUnused');
 
     const player = await this.#requirePlayerWallet(intent.actor, 'actor');
     const payer = await this.#requireEntityWallet(RENTAL_ENTITY);
 
-    let refund = this.#refundAmount(intent.vehicle, minutesUnused);
+    const { rental, rentedMinutes } = requireRental(
+      await this.#backend.getTx(intent.rentalId),
+      player.id,
+      payer.id,
+    );
+    if (minutesUnused > rentedMinutes) {
+      throw new InvalidIntent(
+        `minutesUnused (${minutesUnused}) exceeds the ${rentedMinutes} minutes rented`,
+      );
+    }
+
+    const refund = (rental.amount * BigInt(minutesUnused)) / BigInt(rentedMinutes);
     requirePositive(refund, 'refund');
 
-    // A refund must never exceed what the player actually paid for this vehicle.
-    // The backend has no rental table, so the cap is reconstructed from the
-    // hash-chained history: rentals of this vehicle paid, minus refunds already
-    // taken. `null` means the scan was truncated and the cap is not trustworthy.
-    const outstanding = await this.#rentalOutstanding(player.id, payer.id, intent.vehicle);
-    if (outstanding !== null) {
-      if (outstanding <= 0n) {
-        throw new InvalidIntent(
-          `No outstanding rental of "${intent.vehicle}" to refund for ${intent.actor}`,
-        );
-      }
-      if (refund > outstanding) refund = outstanding;
+    let ref;
+    try {
+      ref = await this.#backend.transfer(payer.id, player.id, refund, {
+        ...this.#memo(intent, `${rental.memo.meta?.['vehicle'] ?? 'rental'} — refund ${minutesUnused}min`),
+        key: `return:${intent.rentalId}`,
+        meta: { rental: intent.rentalId, minutesUnused: String(minutesUnused) },
+      });
+    } catch (cause) {
+      if (cause instanceof DuplicateKey) throw new RentalClosed(intent.rentalId);
+      throw cause;
     }
-
-    // Second, independent clamp: the entity cannot pay out more than it holds.
-    const available = await this.#backend.getBalance(payer.id);
-    if (available <= 0n) {
-      throw new InsufficientFunds(payer.id, refund, available);
-    }
-    if (refund > available) refund = available;
-
-    const ref = await this.#backend.transfer(
-      payer.id,
-      player.id,
-      refund,
-      this.#memo(intent, `${intent.vehicle} — refund ${minutesUnused}min`),
-    );
 
     return await this.#result(
       ref,
@@ -471,61 +534,6 @@ export class EconomyEngine {
     return priceOf(this.#config, FLAT_RENTAL_PRICE_KEY);
   }
 
-  /**
-   * Refund at the same rate the rental was charged at. For a flat-fee vehicle
-   * there is no per-minute rate to prorate, so the flat fee is refunded once —
-   * then capped below by what was actually paid.
-   */
-  #refundAmount(vehicle: string, minutesUnused: number): bigint {
-    if (this.#config.rentalPerMinute[vehicle] !== undefined) {
-      return rentalRateOf(this.#config, vehicle) * BigInt(minutesUnused);
-    }
-    if (this.#config.prices[FLAT_RENTAL_PRICE_KEY] === undefined) {
-      throw new InvalidIntent(`No rental rate configured for vehicle "${vehicle}"`);
-    }
-    return priceOf(this.#config, FLAT_RENTAL_PRICE_KEY);
-  }
-
-  /**
-   * How much this player still has at stake on this vehicle: sum of RentVehicle
-   * payments to the rental entity minus ReturnVehicle refunds already received.
-   * Returns null when the history scan hit its page cap, in which case the caller
-   * must not trust the number as a cap.
-   */
-  async #rentalOutstanding(
-    playerWallet: WalletId,
-    entityWallet: WalletId,
-    vehicle: string,
-  ): Promise<bigint | null> {
-    const tag = `${vehicle} — `;
-    let paid = 0n;
-    let refunded = 0n;
-    let cursor: string | undefined;
-
-    for (let page = 0; page < HISTORY_MAX_PAGES; page++) {
-      const result = await this.#backend.history(playerWallet, cursor, HISTORY_PAGE_SIZE);
-      for (const tx of result.txs) {
-        const detail = tx.memo.detail;
-        if (typeof detail !== 'string' || !detail.startsWith(tag)) continue;
-        if (tx.memo.intent === 'RentVehicle' && tx.from === playerWallet && tx.to === entityWallet) {
-          paid += tx.amount;
-        } else if (
-          tx.memo.intent === 'ReturnVehicle' &&
-          tx.from === entityWallet &&
-          tx.to === playerWallet
-        ) {
-          refunded += tx.amount;
-        }
-      }
-      if (result.cursor === null) {
-        const outstanding = paid - refunded;
-        return outstanding > 0n ? outstanding : 0n;
-      }
-      cursor = result.cursor;
-    }
-    return null;
-  }
-
   // -------------------------------------------------------------------------
   // Wallets, memos, results
   // -------------------------------------------------------------------------
@@ -595,13 +603,47 @@ export class EconomyEngine {
     return memo;
   }
 
+  /**
+   * Called after the ledger write has settled, so it must never throw: a failed read-back
+   * reports `newBalance: null`, not a failure for money that already moved.
+   */
   async #result(
     ref: { txId: string; hash: string },
     balanceOf: WalletId,
     message: string,
   ): Promise<IntentResult> {
-    const newBalance = await this.#backend.getBalance(balanceOf);
-    return { ok: true, txId: ref.txId, hash: ref.hash, newBalance, message };
+    return {
+      ok: true,
+      txId: ref.txId,
+      hash: ref.hash,
+      newBalance: await this.#balanceOrNull(balanceOf),
+      message,
+    };
+  }
+
+  /** The original result of an intent whose nonce came in again. */
+  async #replayed(prior: Tx, balanceOf: WalletId): Promise<IntentResult> {
+    return {
+      ok: true,
+      txId: prior.id,
+      hash: prior.hash,
+      newBalance: await this.#balanceOrNull(balanceOf),
+      replayed: true,
+      message: 'This intent was already settled; returning the original result.',
+    };
+  }
+
+  async #balanceOrNull(id: WalletId): Promise<bigint | null> {
+    try {
+      return await this.#backend.getBalance(id);
+    } catch (cause) {
+      try {
+        this.#onInternalError(cause, 'post-settle-balance');
+      } catch {
+        // logging must not undo a settled result
+      }
+      return null;
+    }
   }
 
   #displayName(entityId: OwnerId): string {
@@ -663,6 +705,32 @@ function requireWholeCount(value: number, field: string): number {
     throw new InvalidIntent(`${field} must be greater than zero, got ${String(value)}`);
   }
   return value;
+}
+
+/**
+ * The rental tx and the minutes rented, read from its structured `meta`. Throws UnknownRental unless the
+ * tx really is a RentVehicle payment from this player to the rental entity, so one player
+ * cannot cite another's rental (or any non-rental tx) to get a refund. The same message is used
+ * for every mismatch: it must not reveal whether some other player's tx id exists.
+ */
+function requireRental(
+  rental: Tx | null,
+  playerWallet: WalletId,
+  entityWallet: WalletId,
+): { rental: Tx; rentedMinutes: number } {
+  const minutes = rental?.memo.meta?.['minutes'];
+  if (
+    rental === null ||
+    rental.kind !== 'transfer' ||
+    rental.memo.intent !== 'RentVehicle' ||
+    rental.from !== playerWallet ||
+    rental.to !== entityWallet ||
+    typeof minutes !== 'string' ||
+    !/^[1-9][0-9]{0,14}$/.test(minutes)
+  ) {
+    throw new UnknownRental('No such rental for this player');
+  }
+  return { rental, rentedMinutes: Number(minutes) };
 }
 
 /** Only reachable if an adapter sends a type outside the union. */

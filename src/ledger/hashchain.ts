@@ -6,7 +6,7 @@
 import { createHash } from 'node:crypto';
 
 import type { Memo, Tx } from '../types.ts';
-import { InvalidAmount } from '../errors.ts';
+import { InvalidAmount, InvalidIntent } from '../errors.ts';
 
 /** prevHash of the first tx in a chain. */
 export const GENESIS_HASH = '0'.repeat(64);
@@ -44,9 +44,70 @@ export function decodeAmount(text: string): bigint {
   return BigInt(text);
 }
 
+// --- memo validation ---------------------------------------------------------
+// Every backend runs this before writing, so the stored memo is bounded and free of control
+// characters (log/terminal injection) no matter which adapter or engine path produced it.
+
+export const MAX_MEMO_INTENT = 64;
+export const MAX_MEMO_DETAIL = 512;
+export const MAX_MEMO_NONCE = 128;
+export const MAX_MEMO_KEY = 200;
+export const MAX_MEMO_META_ENTRIES = 8;
+export const MAX_MEMO_META_VALUE = 128;
+
+const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
+const META_KEY = /^[a-z][A-Za-z0-9_]{0,31}$/;
+
+function checkText(value: unknown, field: string, max: number, allowEmpty: boolean): void {
+  if (typeof value !== 'string') throw new InvalidIntent(`${field} must be a string`);
+  if (value.length === 0 && !allowEmpty) throw new InvalidIntent(`${field} must not be empty`);
+  if (value.length > max) throw new InvalidIntent(`${field} must be at most ${max} characters`);
+  if (CONTROL_CHARS.test(value)) throw new InvalidIntent(`${field} must not contain control characters`);
+}
+
+export function validateMemo(memo: unknown): asserts memo is Memo {
+  if (typeof memo !== 'object' || memo === null || Array.isArray(memo)) {
+    throw new InvalidIntent('memo must be an object');
+  }
+  const m = memo as Record<string, unknown>;
+  checkText(m['intent'], 'memo.intent', MAX_MEMO_INTENT, false);
+  if (m['detail'] !== undefined) checkText(m['detail'], 'memo.detail', MAX_MEMO_DETAIL, true);
+  if (m['nonce'] !== undefined) checkText(m['nonce'], 'memo.nonce', MAX_MEMO_NONCE, false);
+  if (m['key'] !== undefined) checkText(m['key'], 'memo.key', MAX_MEMO_KEY, false);
+  const meta = m['meta'];
+  if (meta !== undefined) {
+    if (typeof meta !== 'object' || meta === null || Array.isArray(meta)) {
+      throw new InvalidIntent('memo.meta must be an object of string values');
+    }
+    const entries = Object.entries(meta);
+    if (entries.length > MAX_MEMO_META_ENTRIES) {
+      throw new InvalidIntent(`memo.meta may hold at most ${MAX_MEMO_META_ENTRIES} entries`);
+    }
+    for (const [k, v] of entries) {
+      if (!META_KEY.test(k)) throw new InvalidIntent(`memo.meta key ${JSON.stringify(k)} is not allowed`);
+      checkText(v, `memo.meta.${k}`, MAX_MEMO_META_VALUE, true);
+    }
+  }
+}
+
+/** Defensive copy: only known fields, so nothing extra can ride along into storage. */
+export function cloneMemo(memo: Memo): Memo {
+  const out: Memo = { intent: memo.intent };
+  if (memo.detail !== undefined) out.detail = memo.detail;
+  if (memo.nonce !== undefined) out.nonce = memo.nonce;
+  if (memo.key !== undefined) out.key = memo.key;
+  if (memo.meta !== undefined) out.meta = { ...memo.meta };
+  return out;
+}
+
 /** JSON-escapes a string, or emits the bare token `null`. */
 function field(value: string | null): string {
   return value === null ? 'null' : JSON.stringify(value);
+}
+
+/** Entries sorted by key, as a JSON array of pairs: no dependence on object key order. */
+function canonicalMeta(meta: Record<string, string>): string {
+  return JSON.stringify(Object.keys(meta).sort().map((k) => [k, meta[k]]));
 }
 
 /**
@@ -66,6 +127,10 @@ export function canonicalTxPayload(tx: SignableTx): string {
     `memo.intent=${field(memo.intent)}`,
     `memo.detail=${field(memo.detail ?? null)}`,
     `memo.nonce=${field(memo.nonce ?? null)}`,
+    // key and meta are appended only when present, so a memo without them hashes exactly as it
+    // did before they existed and older ledgers still verify.
+    ...(memo.key === undefined ? [] : [`memo.key=${field(memo.key)}`]),
+    ...(memo.meta === undefined ? [] : [`memo.meta=${field(canonicalMeta(memo.meta))}`]),
     `prevHash=${field(tx.prevHash)}`,
     `seq=${field(String(tx.seq))}`,
     `createdAt=${field(tx.createdAt)}`,

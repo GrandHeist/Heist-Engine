@@ -505,6 +505,103 @@ function conformanceSuite(factory: BackendFactory): void {
       assert.equal(b?.memo.nonce, 'n2');
     });
 
+    test('getTxByNonce returns the tx that consumed the nonce, and null otherwise', async () => {
+      const alice = await wallet('alice');
+      assert.equal(await backend.getTxByNonce('nope'), null);
+      const ref = await backend.mint(alice.id, 10n, memo('Test', 'known'));
+      const found = await backend.getTxByNonce('known');
+      assert.equal(found?.id, ref.txId);
+      assert.equal(found?.hash, ref.hash);
+    });
+
+    test('a memo key is accepted once, atomically with the write', async () => {
+      const alice = await wallet('alice');
+      const keyed: Memo = { intent: 'Test', nonce: 'k1', key: 'welcome:alice' };
+      await backend.mint(alice.id, 10n, keyed);
+
+      await rejectsWithCode(
+        backend.mint(alice.id, 10n, { intent: 'Test', nonce: 'k2', key: 'welcome:alice' }),
+        'DUPLICATE_KEY',
+      );
+      // A rejected write leaves nothing behind: balance, nonce and history are untouched.
+      assert.equal(await backend.getBalance(alice.id), 10n);
+      assert.equal(await backend.hasNonce('k2'), false);
+      assert.equal((await backend.history(alice.id)).txs.length, 1);
+
+      // A different key is independent.
+      await backend.mint(alice.id, 5n, { intent: 'Test', nonce: 'k3', key: 'welcome:bob' });
+      assert.equal(await backend.getBalance(alice.id), 15n);
+    });
+
+    test('memo key and meta round-trip and are covered by the hash', async () => {
+      const alice = await wallet('alice');
+      const ref = await backend.mint(alice.id, 10n, {
+        intent: 'RentVehicle',
+        nonce: 'm1',
+        key: 'k',
+        meta: { vehicle: 'bike', minutes: '30' },
+      });
+      const tx = await backend.getTx(ref.txId);
+      assert.deepEqual(tx?.memo.meta, { vehicle: 'bike', minutes: '30' });
+      assert.equal(tx?.memo.key, 'k');
+      assert.deepEqual((await backend.verifyIntegrity()).brokenAt, []);
+    });
+
+    test('malformed memos are rejected before anything is written', async () => {
+      const alice = await wallet('alice');
+      const bad: unknown[] = [
+        { intent: '' },
+        { intent: 'x'.repeat(65) },
+        { intent: 'Test', detail: 'line\nbreak' },
+        { intent: 'Test', detail: 'x'.repeat(513) },
+        { intent: 'Test', detail: 5 },
+        { intent: 'Test', nonce: '' },
+        { intent: 'Test', nonce: 'x'.repeat(129) },
+        { intent: 'Test', key: '' },
+        { intent: 'Test', meta: 'nope' },
+        { intent: 'Test', meta: { 'Bad Key': 'v' } },
+        { intent: 'Test', meta: { k: 5 } },
+        { intent: 'Test', meta: { k: 'a\u0000b' } },
+        { intent: 'Test', meta: Object.fromEntries(Array.from({ length: 9 }, (_, i) => [`k${i}`, 'v'])) },
+        null,
+        'a string',
+      ];
+      for (const m of bad) {
+        await rejectsWithCode(backend.mint(alice.id, 1n, m as Memo), 'INVALID_INTENT');
+      }
+      assert.equal(await backend.getBalance(alice.id), 0n);
+      assert.equal((await backend.history(alice.id)).txs.length, 0);
+    });
+
+    test('a non-bigint amount is rejected on every write path', async () => {
+      const alice = await wallet('alice');
+      const bob = await wallet('bob');
+      await backend.mint(alice.id, 100n, memo('Test'));
+      for (const bad of [5, '5', 5.5, null, undefined, Number.NaN] as unknown[]) {
+        await rejectsWithCode(backend.mint(alice.id, bad as bigint, memo('Test')), 'INVALID_AMOUNT');
+        await rejectsWithCode(backend.burn(alice.id, bad as bigint, memo('Test')), 'INVALID_AMOUNT');
+        await rejectsWithCode(
+          backend.transfer(alice.id, bob.id, bad as bigint, memo('Test')),
+          'INVALID_AMOUNT',
+        );
+      }
+      assert.equal(await backend.getBalance(alice.id), 100n);
+    });
+
+    test('concurrent createWallet for one owner yields one wallet, same id for everyone', async () => {
+      const results = await Promise.all(
+        Array.from({ length: 12 }, () => backend.createWallet('racer', keyFor('racer'))),
+      );
+      assert.equal(new Set(results.map((w) => w.id)).size, 1);
+      assert.equal((await backend.listWallets()).filter((w) => w.ownerId === 'racer').length, 1);
+    });
+
+    test('createWallet rejects a non-string owner id with a typed error', async () => {
+      for (const bad of [undefined, null, 5, '']) {
+        await rejectsWithCode(backend.createWallet(bad as string, keyFor('x')), 'INVALID_INTENT');
+      }
+    });
+
     test('hasNonce is false before settlement and true after', async () => {
       const alice = await wallet('alice');
       assert.equal(await backend.hasNonce('fresh'), false);
