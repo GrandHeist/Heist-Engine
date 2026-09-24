@@ -26,10 +26,14 @@ import {
   GENESIS_HASH,
   canonicalTxPayload,
   cloneMemo,
+  compareCheckpoint,
   hashTx,
+  headOf,
   validateMemo,
   verifyChain,
+  verifyStructure,
 } from './hashchain.ts';
+import type { Checkpoint } from './hashchain.ts';
 
 const DEFAULT_HISTORY_LIMIT = 50;
 const MAX_HISTORY_LIMIT = 500;
@@ -253,8 +257,17 @@ export class MemoryBackend implements LedgerBackend {
   // Integrity
   // -------------------------------------------------------------------------
 
-  async verifyIntegrity(): Promise<IntegrityReport> {
+  async checkpoint(): Promise<Checkpoint | null> {
+    return headOf(this.txs);
+  }
+
+  async verifyIntegrity(expected?: Checkpoint): Promise<IntegrityReport> {
     const { brokenAt } = verifyChain(this.txs);
+    const violations = verifyStructure(this.txs, new Set(this.wallets.keys()));
+    for (const [id, balance] of this.balances) {
+      if (balance < 0n) violations.push({ seq: null, reason: `wallet ${id} has a negative stored balance` });
+    }
+    const checkpoint = expected === undefined ? 'none' : compareCheckpoint(this.txs, expected);
 
     // Fold the whole history and compare against the incrementally maintained
     // balances. Drift between the two is exactly what this check exists to find.
@@ -273,10 +286,17 @@ export class MemoryBackend implements LedgerBackend {
     }
 
     return {
-      ok: brokenAt.length === 0 && balanceMismatches.length === 0,
+      ok:
+        brokenAt.length === 0 &&
+        balanceMismatches.length === 0 &&
+        violations.length === 0 &&
+        (checkpoint === 'none' || checkpoint === 'ok'),
       checked: this.txs.length,
       brokenAt,
       balanceMismatches,
+      violations,
+      head: headOf(this.txs),
+      checkpoint,
     };
   }
 

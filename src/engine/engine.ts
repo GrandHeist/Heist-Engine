@@ -88,6 +88,9 @@ const INITIATOR_IS_RECIPIENT: ReadonlySet<string> = new Set([
   'Theft',
 ]);
 
+/** Longest fine reason kept in a memo. */
+const MAX_REASON = 120;
+
 export interface EconomyEngineOptions {
   backend: LedgerBackend;
   custody: Custody;
@@ -303,7 +306,7 @@ export class EconomyEngine {
 
   /** player -> bike-rental-co, rate * minutes (or the flat fee). */
   async #rentVehicle(intent: RentVehicleIntent): Promise<IntentResult> {
-    assertNonEmpty(intent.vehicle, 'vehicle');
+    assertName(intent.vehicle, 'vehicle');
     const minutes = requireWholeCount(intent.minutes, 'minutes');
 
     const amount = this.#rentalCost(intent.vehicle, minutes);
@@ -380,7 +383,7 @@ export class EconomyEngine {
 
   /** player -> service entity, price * units. */
   async #buyService(intent: BuyServiceIntent): Promise<IntentResult> {
-    assertNonEmpty(intent.service, 'service');
+    assertName(intent.service, 'service');
     const units = intent.units === undefined ? 1 : requireWholeCount(intent.units, 'units');
 
     // Unknown service is reported as UnknownEntity per the intent catalog: there
@@ -436,9 +439,7 @@ export class EconomyEngine {
     const player = await this.#requirePlayerWallet(intent.actor, 'actor');
     const treasury = await this.#requireEntityWallet(TREASURY_ID);
 
-    const reason = typeof intent.reason === 'string' && intent.reason.trim() !== ''
-      ? intent.reason.trim()
-      : undefined;
+    const reason = cleanReason(intent.reason);
 
     const ref = await this.#backend.transfer(
       player.id,
@@ -682,6 +683,33 @@ function assertOwnerId(value: unknown, field: string): void {
       `${field} must be a 1-128 character id with no leading/trailing whitespace or control characters`,
     );
   }
+}
+
+/** A catalog key an adapter names (vehicle, service): short, single-line, no padding. */
+function assertName(value: unknown, field: string): void {
+  if (
+    typeof value !== 'string' ||
+    value.length === 0 ||
+    value.length > 64 ||
+    value !== value.trim() ||
+    /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/.test(value)
+  ) {
+    throw new InvalidIntent(`${field} must be 1-64 characters, single-line, with no padding`);
+  }
+}
+
+/**
+ * Free-text a caller supplies for display (a fine's reason). It ends up in a hashed memo, so it
+ * is flattened to one line and capped rather than rejected: a rude or long reason must not stop a fine.
+ */
+function cleanReason(raw: unknown): string | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const flat = raw
+    .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (flat === '') return undefined;
+  return flat.length > MAX_REASON ? `${flat.slice(0, MAX_REASON - 1)}…` : flat;
 }
 
 function assertNonEmpty(value: string, field: string): void {

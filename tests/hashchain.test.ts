@@ -10,10 +10,13 @@ import {
   GENESIS_HASH,
   canonicalTxPayload,
   computeHash,
+  compareCheckpoint,
   decodeAmount,
   encodeAmount,
   hashTx,
+  headOf,
   verifyChain,
+  verifyStructure,
 } from '../src/ledger/hashchain.ts';
 import type { SignableTx } from '../src/ledger/hashchain.ts';
 import type { Tx } from '../src/types.ts';
@@ -285,5 +288,83 @@ describe('verifyChain', () => {
     );
     assert.equal(shuffled.length, 5);
     assert.deepEqual(verifyChain(shuffled), { ok: true, brokenAt: [] });
+  });
+});
+
+describe('decodeAmount — domain minimum', () => {
+  test('a caller that knows the domain rejects negatives and zero where they make no sense', () => {
+    assert.equal(decodeAmount('-5'), -5n, 'the bare codec stays general');
+    assert.throws(() => decodeAmount('-5', 0n), (e: unknown) => (e as EngineError).code === 'INVALID_AMOUNT');
+    assert.throws(() => decodeAmount('0', 1n), (e: unknown) => (e as EngineError).code === 'INVALID_AMOUNT');
+    assert.equal(decodeAmount('0', 0n), 0n);
+    assert.equal(decodeAmount('7', 1n), 7n);
+  });
+});
+
+describe('verifyStructure', () => {
+  const wallets = new Set(['a', 'b']);
+  function tx(seq: number, over: Partial<Tx>): Tx {
+    return {
+      id: `t${seq}`,
+      kind: 'transfer',
+      from: 'a',
+      to: 'b',
+      amount: 1n,
+      memo: { intent: 'T', nonce: `n${seq}` },
+      prevHash: GENESIS_HASH,
+      hash: 'h',
+      signature: null,
+      createdAt: 'now',
+      seq,
+      ...over,
+    };
+  }
+  const mint = (seq: number, over: Partial<Tx> = {}): Tx => tx(seq, { kind: 'mint', from: null, to: 'a', amount: 10n, ...over });
+  const reasons = (txs: Tx[]): string[] => verifyStructure(txs, wallets).map((v) => v.reason);
+
+  test('a well-formed history has no violations', () => {
+    assert.deepEqual(reasons([mint(0), tx(1, { amount: 4n })]), []);
+  });
+
+  test('flags each way a re-hashed row can break the ledger rules', () => {
+    assert.match(reasons([mint(0, { amount: 0n })]).join(), /positive/);
+    assert.match(reasons([mint(0, { amount: -3n })]).join(), /positive/);
+    assert.match(reasons([mint(0, { from: 'b' })]).join(), /mint must have no source/);
+    assert.match(reasons([mint(0), tx(1, { kind: 'burn', to: 'b' })]).join(), /burn must have no destination/);
+    assert.match(reasons([mint(0), tx(1, { to: 'a' })]).join(), /same wallet/);
+    assert.match(reasons([mint(0), tx(1, { to: null })]).join(), /needs both wallets/);
+    assert.match(reasons([mint(0), tx(1, { to: 'ghost' })]).join(), /unknown wallet ghost/);
+    assert.match(reasons([mint(0), tx(1, { amount: 11n })]).join(), /spends 11 but held 10/);
+    assert.match(reasons([mint(0), tx(1, { memo: { intent: '' } })]).join(), /memo invalid/);
+    assert.match(reasons([mint(0), tx(1, { memo: { intent: 'T', nonce: 'n0' } })]).join(), /nonce "n0" reused/);
+    assert.match(
+      reasons([mint(0, { memo: { intent: 'T', key: 'k' } }), tx(1, { memo: { intent: 'T', key: 'k' } })]).join(),
+      /key "k" reused/,
+    );
+  });
+
+  test('a wallet that ends negative is reported even if no single row is the culprit', () => {
+    const found = verifyStructure([mint(0), tx(1, { amount: 11n })], wallets);
+    assert.ok(found.some((v) => v.seq === null && /negative balance/.test(v.reason)));
+  });
+});
+
+describe('checkpoints', () => {
+  test('headOf is the highest seq, or null for an empty chain', () => {
+    const chain = buildChain(3);
+    assert.deepEqual(headOf(chain), { seq: 2, hash: chain[2]?.hash });
+    assert.deepEqual(headOf([...chain].reverse()), { seq: 2, hash: chain[2]?.hash });
+    assert.equal(headOf([]), null);
+  });
+
+  test('compareCheckpoint tells extension, truncation and rewriting apart', () => {
+    const chain = buildChain(4);
+    const cp = { seq: 2, hash: chain[2]?.hash ?? '' };
+    assert.equal(compareCheckpoint(chain, cp), 'ok');
+    assert.equal(compareCheckpoint(chain.slice(0, 2), cp), 'truncated');
+    assert.equal(compareCheckpoint([], cp), 'truncated');
+    assert.equal(compareCheckpoint(chain.slice(0, 3), cp), 'ok', 'a longer chain still contains the checkpoint');
+    const rewritten = chain.map((t) => (t.seq === 2 ? { ...t, hash: 'f'.repeat(64) } : t));
+    assert.equal(compareCheckpoint(rewritten, cp), 'rewritten');
   });
 });

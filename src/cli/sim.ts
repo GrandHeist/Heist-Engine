@@ -17,6 +17,7 @@
 // ===========================================================================
 
 import { randomUUID } from 'node:crypto';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 
 import { defaultConfig } from '../config/config.ts';
@@ -25,7 +26,7 @@ import { EconomyEngine } from '../engine/engine.ts';
 import { Custody } from '../engine/custody.ts';
 import { MemoryBackend } from '../ledger/memory.ts';
 import { SqliteBackend } from '../ledger/sqlite.ts';
-import type { BackendName, LedgerBackend } from '../ledger/backend.ts';
+import type { BackendName, Checkpoint, IntegrityReport, LedgerBackend } from '../ledger/backend.ts';
 import type { EngineResponse, Intent, OwnerId, Tx, Wallet } from '../types.ts';
 
 const DEFAULT_DB_PATH = './heist.sqlite';
@@ -91,7 +92,7 @@ const USAGE = [
   '  bal    <owner>                     balance',
   '  hist   <owner> [n]                 recent history (default 10)',
   '  wallets                            list every wallet',
-  '  verify                             verify the hash chain and balances',
+  '  verify                             verify the hash chain, structure, balances and saved checkpoint',
   '  seed                               fund the payout entities, create a couple of demo players',
   '  help                               this list',
   '  exit                               quit',
@@ -189,6 +190,41 @@ function tokenize(line: string): string[] {
   return line.trim().split(/\s+/).filter((part) => part !== '');
 }
 
+function renderReport(report: IntegrityReport): void {
+  out(`  chain ${report.ok ? 'OK' : 'BROKEN'} — ${String(report.checked)} tx checked`);
+  if (report.head !== null) out(`  head seq ${String(report.head.seq)} hash ${report.head.hash}`);
+  if (report.brokenAt.length > 0) out(`  broken hashes at seq: ${report.brokenAt.join(', ')}`);
+  if (report.balanceMismatches.length > 0) {
+    out(`  balance mismatches: ${report.balanceMismatches.join(', ')}`);
+  }
+  for (const v of report.violations) {
+    out(`  rule broken${v.seq === null ? '' : ` at seq ${String(v.seq)}`}: ${v.reason}`);
+  }
+  if (report.checkpoint === 'truncated' || report.checkpoint === 'rewritten') {
+    out(`  saved checkpoint says the ledger was ${report.checkpoint}`);
+  }
+}
+
+/** A checkpoint file we wrote ourselves; anything else in it is treated as absent, loudly. */
+function readCheckpointFile(path: string): Checkpoint | null {
+  if (!existsSync(path)) return null;
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(path, 'utf8'));
+    if (
+      typeof parsed === 'object' &&
+      parsed !== null &&
+      Number.isSafeInteger((parsed as { seq?: unknown }).seq) &&
+      typeof (parsed as { hash?: unknown }).hash === 'string'
+    ) {
+      const { seq, hash } = parsed as Checkpoint;
+      return { seq, hash };
+    }
+  } catch {
+    // fall through
+  }
+  throw new Error(`checkpoint file ${path} is unreadable; move it aside to accept the current ledger`);
+}
+
 // ---------------------------------------------------------------------------
 // The simulator
 // ---------------------------------------------------------------------------
@@ -197,12 +233,22 @@ class Simulator {
   readonly #engine: EconomyEngine;
   readonly #backend: LedgerBackend;
   readonly #config: HeistConfig;
+  readonly #checkpointFile: string | null;
+  #checkpoint: Checkpoint | null;
   #running = true;
 
-  constructor(engine: EconomyEngine, backend: LedgerBackend, config: HeistConfig) {
+  constructor(
+    engine: EconomyEngine,
+    backend: LedgerBackend,
+    config: HeistConfig,
+    checkpointFile: string | null,
+    checkpoint: Checkpoint | null,
+  ) {
     this.#engine = engine;
     this.#backend = backend;
     this.#config = config;
+    this.#checkpointFile = checkpointFile;
+    this.#checkpoint = checkpoint;
   }
 
   get running(): boolean {
@@ -441,14 +487,25 @@ class Simulator {
   }
 
   async #verify(): Promise<void> {
-    const report = await this.#backend.verifyIntegrity();
-    out(`  chain ${report.ok ? 'OK' : 'BROKEN'} — ${String(report.checked)} tx checked`);
-    if (report.brokenAt.length > 0) {
-      out(`  broken hashes at seq: ${report.brokenAt.join(', ')}`);
-    }
-    if (report.balanceMismatches.length > 0) {
-      out(`  balance mismatches: ${report.balanceMismatches.join(', ')}`);
-    }
+    renderReport(await this.#backend.verifyIntegrity(this.#checkpoint ?? undefined));
+  }
+
+  // -- checkpoint sidecar ----------------------------------------------------
+  // The head (seq + hash) is the only thing that reveals a chopped-off tail. It is kept in a file
+  // next to a sqlite DB: enough to catch accidents and a careless edit, NOT a defence against
+  // someone who can write both files. Real deployments should copy it somewhere the ledger's
+  // writer cannot reach (another host, an append-only log, a public post).
+
+  get checkpoint(): Checkpoint | null {
+    return this.#checkpoint;
+  }
+
+  async saveCheckpoint(): Promise<void> {
+    if (this.#checkpointFile === null) return;
+    const head = await this.#backend.checkpoint();
+    if (head === null) return;
+    this.#checkpoint = head;
+    writeFileSync(this.#checkpointFile, `${JSON.stringify(head)}\n`, 'utf8');
   }
 
   /** wallet id -> owner id, so history reads as names rather than uuids. */
@@ -526,9 +583,28 @@ async function main(): Promise<number> {
     return 1;
   }
 
+  // Verify before serving anything: a ledger that fails is not one to add rows to.
+  const checkpointFile = config.backend === 'sqlite' ? `${config.dbPath ?? options.dbPath}.head` : null;
+  let saved: Checkpoint | null = null;
+  try {
+    saved = checkpointFile === null ? null : readCheckpointFile(checkpointFile);
+    const report = await backend.verifyIntegrity(saved ?? undefined);
+    if (!report.ok) {
+      out('startup refused: the ledger failed verification');
+      renderReport(report);
+      await backend.close();
+      return 1;
+    }
+  } catch (cause) {
+    out(`startup failed: ${cause instanceof Error ? cause.message : String(cause)}`);
+    await backend.close();
+    return 1;
+  }
+
   const interactive = process.stdin.isTTY === true;
-  const sim = new Simulator(engine, backend, config);
+  const sim = new Simulator(engine, backend, config, checkpointFile, saved);
   sim.banner(interactive);
+  await sim.saveCheckpoint();
 
   const rl = createInterface({
     input: process.stdin,
@@ -545,6 +621,7 @@ async function main(): Promise<number> {
   try {
     for await (const line of rl) {
       await sim.handle(line);
+      await sim.saveCheckpoint();
       if (!sim.running) break;
       if (interactive) rl.prompt();
     }

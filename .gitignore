@@ -19,3 +19,4 @@ BRIEF.md
 .venv/
 venv/
 __pycache__/
+*.sqlite.head

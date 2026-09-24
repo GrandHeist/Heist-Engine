@@ -3,6 +3,9 @@
 // whole architectural bet, so nothing may leak backend specifics through it.
 
 import type { Memo, Tx, TxRef, Wallet, WalletId, OwnerId } from '../types.ts';
+import type { Checkpoint, CheckpointStatus, Violation } from './hashchain.ts';
+
+export type { Checkpoint, CheckpointStatus, Violation };
 
 export type BackendName = 'memory' | 'sqlite' | 'postgres' | 'solana' | 'bsc';
 
@@ -38,6 +41,19 @@ export interface IntegrityReport {
   brokenAt: number[];
   /** Wallets whose folded history disagrees with the stored balance. */
   balanceMismatches: WalletId[];
+  /**
+   * Rows that hash correctly but break a ledger rule (mint with a source, amount <= 0, overdraft,
+   * unknown wallet, malformed memo, replay-guard rows that no longer match the ledger). Empty when ok.
+   */
+  violations: Violation[];
+  /** The chain's current head, or null when empty. Export it and hand it back later. */
+  head: Checkpoint | null;
+  /**
+   * How the ledger compares with the checkpoint passed to verifyIntegrity: 'none' if none was
+   * given, 'ok', 'truncated' (fewer txs than the checkpoint saw) or 'rewritten' (same position,
+   * different hash). Only a checkpoint kept OUTSIDE the ledger can catch a cut-off tail.
+   */
+  checkpoint: CheckpointStatus;
 }
 
 export interface LedgerBackend {
@@ -77,6 +93,8 @@ export interface LedgerBackend {
   /** The tx that consumed this nonce, so a replay can be answered with the original result. */
   getTxByNonce(nonce: string): Promise<Tx | null>;
 
-  /** Walk the whole chain and verify hashes and balances. */
-  verifyIntegrity(): Promise<IntegrityReport>;
+  /** Walk the whole chain and verify hashes, structure and balances. Never throws on tampered data. */
+  verifyIntegrity(expected?: Checkpoint): Promise<IntegrityReport>;
+  /** The current head of the chain, to store somewhere the ledger's own writer cannot reach. */
+  checkpoint(): Promise<Checkpoint | null>;
 }

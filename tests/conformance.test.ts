@@ -505,6 +505,33 @@ function conformanceSuite(factory: BackendFactory): void {
       assert.equal(b?.memo.nonce, 'n2');
     });
 
+    test('checkpoint and verifyIntegrity(checkpoint) agree, and an extension keeps the old one valid', async () => {
+      const alice = await wallet('alice');
+      assert.equal(await backend.checkpoint(), null);
+      assert.equal((await backend.verifyIntegrity()).head, null);
+
+      await backend.mint(alice.id, 10n, memo('Test', 'c1'));
+      const cp = await backend.checkpoint();
+      assert.notEqual(cp, null);
+      assert.equal(cp?.seq, 0);
+
+      await backend.mint(alice.id, 10n, memo('Test', 'c2'));
+      const report = await backend.verifyIntegrity(cp ?? undefined);
+      assert.equal(report.ok, true);
+      assert.equal(report.checkpoint, 'ok');
+      assert.equal(report.head?.seq, 1);
+      assert.deepEqual(report.violations, []);
+
+      // A checkpoint from a longer, different history is not satisfied by this ledger.
+      const ahead = { seq: 5, hash: 'a'.repeat(64) };
+      const behind = await backend.verifyIntegrity(ahead);
+      assert.equal(behind.checkpoint, 'truncated');
+      assert.equal(behind.ok, false);
+      const forked = await backend.verifyIntegrity({ seq: 0, hash: 'a'.repeat(64) });
+      assert.equal(forked.checkpoint, 'rewritten');
+      assert.equal(forked.ok, false);
+    });
+
     test('getTxByNonce returns the tx that consumed the nonce, and null otherwise', async () => {
       const alice = await wallet('alice');
       assert.equal(await backend.getTxByNonce('nope'), null);

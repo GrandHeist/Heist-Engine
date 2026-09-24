@@ -41,61 +41,98 @@ import {
   GENESIS_HASH,
   canonicalTxPayload,
   decodeAmount,
+  compareCheckpoint,
   encodeAmount,
   hashTx,
+  headOf,
   validateMemo,
   verifyChain,
+  verifyStructure,
 } from './hashchain.ts';
+import type { Checkpoint, Violation } from './hashchain.ts';
 
+const BUSY_TIMEOUT_MS = 5000;
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 500;
 
+// Canonical non-negative base-10 text (no sign, no leading zero, digits only), as a CHECK body.
+// SQLite has no regex, so GLOB: first char a digit, no non-digit anywhere, and "0" only alone.
+const NON_NEGATIVE_TEXT = (col: string): string =>
+  `${col} GLOB '[0-9]*' AND ${col} NOT GLOB '*[^0-9]*' AND (${col} = '0' OR ${col} NOT GLOB '0*')`;
+
+// Constraints only bind on tables created by this SCHEMA; `CREATE TABLE IF NOT EXISTS` leaves a
+// pre-existing table alone. Triggers are `IF NOT EXISTS` too, so they do reach an old database.
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS wallets (
-  id         TEXT PRIMARY KEY,
-  owner_id   TEXT UNIQUE,
-  address    TEXT,
-  pubkey     TEXT,
-  is_entity  INTEGER,
-  created_at TEXT
+  id         TEXT NOT NULL PRIMARY KEY,
+  owner_id   TEXT NOT NULL UNIQUE CHECK (length(owner_id) > 0),
+  address    TEXT NOT NULL CHECK (length(address) > 0),
+  pubkey     TEXT NOT NULL CHECK (length(pubkey) > 0),
+  is_entity  INTEGER NOT NULL CHECK (is_entity IN (0, 1)),
+  created_at TEXT NOT NULL
 );
 
 -- amount is TEXT. See ADR 0002. Never SUM() it, never ORDER BY it.
 CREATE TABLE IF NOT EXISTS transactions (
-  id          TEXT PRIMARY KEY,
-  seq         INTEGER UNIQUE,
-  kind        TEXT,
-  from_wallet TEXT NULL,
-  to_wallet   TEXT NULL,
-  amount      TEXT,
-  memo        TEXT,
-  prev_hash   TEXT,
-  hash        TEXT,
+  id          TEXT NOT NULL PRIMARY KEY,
+  seq         INTEGER NOT NULL UNIQUE CHECK (seq >= 0),
+  kind        TEXT NOT NULL CHECK (kind IN ('transfer', 'mint', 'burn')),
+  from_wallet TEXT NULL REFERENCES wallets(id),
+  to_wallet   TEXT NULL REFERENCES wallets(id),
+  amount      TEXT NOT NULL CHECK (amount <> '0' AND (${NON_NEGATIVE_TEXT('amount')})),
+  memo        TEXT NOT NULL,
+  prev_hash   TEXT NOT NULL CHECK (length(prev_hash) = 64),
+  hash        TEXT NOT NULL CHECK (length(hash) = 64),
   signature   TEXT NULL,
-  created_at  TEXT
+  created_at  TEXT NOT NULL,
+  CHECK (
+    (kind = 'mint'     AND from_wallet IS NULL     AND to_wallet IS NOT NULL) OR
+    (kind = 'burn'     AND from_wallet IS NOT NULL AND to_wallet IS NULL) OR
+    (kind = 'transfer' AND from_wallet IS NOT NULL AND to_wallet IS NOT NULL AND from_wallet <> to_wallet)
+  )
 );
 
+-- A balance can never be negative: the overdraft check in append() is backed by the schema.
 CREATE TABLE IF NOT EXISTS balances (
-  wallet_id TEXT PRIMARY KEY,
-  amount    TEXT
+  wallet_id TEXT NOT NULL PRIMARY KEY REFERENCES wallets(id),
+  amount    TEXT NOT NULL CHECK (${NON_NEGATIVE_TEXT('amount')})
 );
 
 CREATE TABLE IF NOT EXISTS nonces (
-  nonce      TEXT PRIMARY KEY,
-  tx_id      TEXT,
-  created_at TEXT
+  nonce      TEXT NOT NULL PRIMARY KEY,
+  tx_id      TEXT NOT NULL REFERENCES transactions(id),
+  created_at TEXT NOT NULL
 );
 
 -- Business-object keys (Memo.key): at most one tx per key, enforced by the PRIMARY KEY.
 CREATE TABLE IF NOT EXISTS memo_keys (
-  key        TEXT PRIMARY KEY,
-  tx_id      TEXT,
-  created_at TEXT
+  key        TEXT NOT NULL PRIMARY KEY,
+  tx_id      TEXT NOT NULL REFERENCES transactions(id),
+  created_at TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_transactions_from_wallet ON transactions(from_wallet);
 CREATE INDEX IF NOT EXISTS idx_transactions_to_wallet   ON transactions(to_wallet);
 CREATE INDEX IF NOT EXISTS idx_transactions_seq         ON transactions(seq);
+
+-- Append-only. These stop accidents and casual tampering through this schema; anyone with write
+-- access to the file can DROP TRIGGER. That is what the hash chain and a stored checkpoint are for.
+CREATE TRIGGER IF NOT EXISTS transactions_no_update BEFORE UPDATE ON transactions
+  BEGIN SELECT RAISE(ABORT, 'transactions is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS transactions_no_delete BEFORE DELETE ON transactions
+  BEGIN SELECT RAISE(ABORT, 'transactions is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS nonces_no_update BEFORE UPDATE ON nonces
+  BEGIN SELECT RAISE(ABORT, 'nonces is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS nonces_no_delete BEFORE DELETE ON nonces
+  BEGIN SELECT RAISE(ABORT, 'nonces is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS memo_keys_no_update BEFORE UPDATE ON memo_keys
+  BEGIN SELECT RAISE(ABORT, 'memo_keys is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS memo_keys_no_delete BEFORE DELETE ON memo_keys
+  BEGIN SELECT RAISE(ABORT, 'memo_keys is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS wallets_no_update BEFORE UPDATE ON wallets
+  BEGIN SELECT RAISE(ABORT, 'wallets is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS wallets_no_delete BEFORE DELETE ON wallets
+  BEGIN SELECT RAISE(ABORT, 'wallets is append-only'); END;
 `;
 
 // --- row coercion -----------------------------------------------------------
@@ -131,6 +168,16 @@ function readSmallInt(row: Record<string, SQLOutputValue>, column: string): numb
     return Number(value);
   }
   throw new LedgerCorrupt(`Column "${column}" is not a small INTEGER (got ${typeof value})`);
+}
+
+/** A stored amount, decoded, and required to be >= min. A row that breaks that is corruption. */
+function readAmount(row: Record<string, SQLOutputValue>, column: string, min: bigint): bigint {
+  const text = readText(row, column);
+  try {
+    return decodeAmount(text, min);
+  } catch {
+    throw new LedgerCorrupt(`Column "${column}" does not hold a canonical amount of at least ${min}`);
+  }
 }
 
 function isTxKind(value: string): value is TxKind {
@@ -223,7 +270,12 @@ export class SqliteBackend implements LedgerBackend {
 
   async init(): Promise<void> {
     const db = this.database();
+    // Wait for another writer (a second process, a backup) instead of failing at once.
+    db.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`);
     db.exec('PRAGMA journal_mode = WAL');
+    // In WAL mode SQLite's default (NORMAL) can lose the newest committed transactions on power
+    // loss. Money is not allowed to be that casual: fsync every commit on a real file.
+    if (this.path !== ':memory:') db.exec('PRAGMA synchronous = FULL');
     db.exec('PRAGMA foreign_keys = ON');
     db.exec(SCHEMA);
   }
@@ -325,7 +377,7 @@ export class SqliteBackend implements LedgerBackend {
   async getBalance(id: WalletId): Promise<bigint> {
     const row = this.database().prepare('SELECT amount FROM balances WHERE wallet_id = ?').get(id);
     if (row === undefined) throw new UnknownWallet(id);
-    return decodeAmount(readText(row, 'amount'));
+    return readAmount(row, 'amount', 0n);
   }
 
   // --- ledger writes --------------------------------------------------------
@@ -512,53 +564,131 @@ export class SqliteBackend implements LedgerBackend {
 
   // --- integrity ------------------------------------------------------------
 
+  async checkpoint(): Promise<Checkpoint | null> {
+    const tail = this.chainTail();
+    return tail === null ? null : { seq: tail.seq, hash: tail.hash };
+  }
+
   /**
-   * Walks the chain in seq order, recomputes every hash and every prev_hash link, and independently
-   * folds the whole history into per-wallet totals to compare against the maintained `balances`
-   * table. ADR 0002 accepts that the maintained balance can drift; this is what detects it.
+   * Reads every row LENIENTLY (a row that cannot be decoded is reported, not thrown), then checks
+   *   1. hashes and prev_hash links (hashchain.verifyChain: same breaks on every backend),
+   *   2. ledger rules a re-hashed row can still break (hashchain.verifyStructure),
+   *   3. the maintained `balances` table against an independent fold of the history (ADR 0002
+   *      accepts that it can drift; this is what detects it), and no negative stored balance,
+   *   4. that the replay-guard tables (`nonces`, `memo_keys`) still match the ledger row for row,
+   *      because a deleted nonce row quietly re-opens a replay,
+   *   5. optionally, a checkpoint kept outside the database (truncation / rewritten tail).
    */
-  async verifyIntegrity(): Promise<IntegrityReport> {
+  async verifyIntegrity(expected?: Checkpoint): Promise<IntegrityReport> {
     const db = this.database();
-    const txs = db
-      .prepare('SELECT * FROM transactions ORDER BY seq ASC')
-      .all()
-      .map((row) => this.toTx(row));
+    const rows = db.prepare('SELECT * FROM transactions ORDER BY seq ASC').all();
+
+    const txs: Tx[] = [];
+    const violations: Violation[] = [];
+    for (const row of rows) {
+      try {
+        txs.push(this.toTx(row));
+      } catch (error) {
+        const seq = row['seq'];
+        violations.push({
+          seq: typeof seq === 'number' ? seq : null,
+          reason: `row cannot be decoded: ${error instanceof Error ? error.message : String(error)}`,
+        });
+      }
+    }
 
     // Hash and linkage checks live in hashchain.ts so every backend reports identical breaks.
+    // An undecodable row leaves a gap in seq, which shows up here as a break too.
     const { brokenAt } = verifyChain(txs);
 
-    const folded = new Map<WalletId, bigint>();
+    const walletIds = new Set<WalletId>();
+    for (const walletRow of db.prepare('SELECT id FROM wallets').all()) {
+      walletIds.add(readText(walletRow, 'id'));
+    }
+    violations.push(...verifyStructure(txs, walletIds));
 
     // Every known wallet starts at zero, so a wallet with a stored balance but no history is
     // still checked.
-    for (const walletRow of db.prepare('SELECT id FROM wallets').all()) {
-      folded.set(readText(walletRow, 'id'), 0n);
-    }
-
+    const folded = new Map<WalletId, bigint>();
+    for (const id of walletIds) folded.set(id, 0n);
     for (const tx of txs) {
       if (tx.from !== null) folded.set(tx.from, (folded.get(tx.from) ?? 0n) - tx.amount);
       if (tx.to !== null) folded.set(tx.to, (folded.get(tx.to) ?? 0n) + tx.amount);
     }
 
     const stored = new Map<WalletId, bigint>();
+    const undecodable = new Set<WalletId>();
     for (const row of db.prepare('SELECT wallet_id, amount FROM balances').all()) {
-      stored.set(readText(row, 'wallet_id'), decodeAmount(readText(row, 'amount')));
+      const id = readText(row, 'wallet_id');
+      try {
+        stored.set(id, readAmount(row, 'amount', 0n));
+      } catch (error) {
+        undecodable.add(id);
+        violations.push({
+          seq: null,
+          reason: `balance of ${id} is invalid: ${error instanceof Error ? error.message : String(error)}`,
+        });
+      }
     }
 
     const balanceMismatches: WalletId[] = [];
-    for (const walletId of new Set([...folded.keys(), ...stored.keys()])) {
-      if ((folded.get(walletId) ?? 0n) !== (stored.get(walletId) ?? 0n)) {
+    for (const walletId of new Set([...folded.keys(), ...stored.keys(), ...undecodable])) {
+      if (undecodable.has(walletId) || (folded.get(walletId) ?? 0n) !== (stored.get(walletId) ?? 0n)) {
         balanceMismatches.push(walletId);
       }
     }
     balanceMismatches.sort();
 
+    violations.push(...this.replayGuardViolations(txs));
+
+    const checkpoint = expected === undefined ? 'none' : compareCheckpoint(txs, expected);
+
     return {
-      ok: brokenAt.length === 0 && balanceMismatches.length === 0,
-      checked: txs.length,
+      ok:
+        brokenAt.length === 0 &&
+        balanceMismatches.length === 0 &&
+        violations.length === 0 &&
+        (checkpoint === 'none' || checkpoint === 'ok'),
+      checked: rows.length,
       brokenAt,
       balanceMismatches,
+      violations,
+      head: headOf(txs),
+      checkpoint,
     };
+  }
+
+  /** `nonces` and `memo_keys` must list exactly the nonces/keys the ledger rows carry. */
+  private replayGuardViolations(txs: readonly Tx[]): Violation[] {
+    const db = this.database();
+    const out: Violation[] = [];
+    const txIds = new Set(txs.map((tx) => tx.id));
+
+    const guards = [
+      { table: 'nonces', column: 'nonce', of: (tx: Tx) => tx.memo.nonce },
+      { table: 'memo_keys', column: 'key', of: (tx: Tx) => tx.memo.key },
+    ] as const;
+
+    for (const guard of guards) {
+      const recorded = new Map<string, string>();
+      for (const row of db.prepare(`SELECT ${guard.column} AS k, tx_id FROM ${guard.table}`).all()) {
+        recorded.set(readText(row, 'k'), readText(row, 'tx_id'));
+      }
+      for (const tx of txs) {
+        const value = guard.of(tx);
+        if (value === undefined) continue;
+        if (recorded.get(value) !== tx.id) {
+          out.push({ seq: tx.seq, reason: `${guard.table} has no matching row for ${JSON.stringify(value)}` });
+        }
+      }
+      const valuesInLedger = new Set(txs.map(guard.of).filter((v): v is string => v !== undefined));
+      for (const [value, txId] of recorded) {
+        if (!txIds.has(txId) || !valuesInLedger.has(value)) {
+          out.push({ seq: null, reason: `${guard.table} row ${JSON.stringify(value)} points at no ledger tx` });
+        }
+      }
+    }
+    return out;
   }
 
   // --- internals ------------------------------------------------------------
@@ -595,7 +725,7 @@ export class SqliteBackend implements LedgerBackend {
       .prepare('SELECT amount FROM balances WHERE wallet_id = ?')
       .get(id);
     if (row === undefined) throw new UnknownWallet(id);
-    return decodeAmount(readText(row, 'amount'));
+    return readAmount(row, 'amount', 0n);
   }
 
   private setBalance(id: WalletId, amount: bigint): void {
@@ -631,7 +761,7 @@ export class SqliteBackend implements LedgerBackend {
       kind,
       from: readNullableText(row, 'from_wallet'),
       to: readNullableText(row, 'to_wallet'),
-      amount: decodeAmount(readText(row, 'amount')),
+      amount: readAmount(row, 'amount', 1n),
       memo: decodeMemo(readText(row, 'memo')),
       prevHash: readText(row, 'prev_hash'),
       hash: readText(row, 'hash'),

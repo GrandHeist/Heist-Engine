@@ -30,8 +30,14 @@ export function encodeAmount(value: bigint): string {
   return value.toString(10);
 }
 
-/** Canonical decimal string -> bigint. Rejects every non-canonical form. */
-export function decodeAmount(text: string): bigint {
+/**
+ * Canonical decimal string -> bigint. Rejects every non-canonical form.
+ *
+ * The canonical grammar allows a leading '-' (the codec is general), so a caller that knows the
+ * value's domain MUST pass `min`: 1n for a tx amount, 0n for a balance. Without it a stored
+ * "-5" decodes happily and turns a debit into a credit downstream.
+ */
+export function decodeAmount(text: string, min?: bigint): bigint {
   if (typeof text !== 'string' || text.length === 0) {
     throw new InvalidAmount('Amount must be a non-empty canonical base-10 string');
   }
@@ -41,7 +47,11 @@ export function decodeAmount(text: string): bigint {
         '(no leading zeros, "+", whitespace, separators or decimal points)',
     );
   }
-  return BigInt(text);
+  const value = BigInt(text);
+  if (min !== undefined && value < min) {
+    throw new InvalidAmount(`Amount ${text} is below the minimum ${min.toString(10)}`);
+  }
+  return value;
 }
 
 // --- memo validation ---------------------------------------------------------
@@ -145,6 +155,104 @@ export function hashTx(payload: string): string {
 /** Convenience: canonicalize and hash in one step. */
 export function computeHash(tx: SignableTx): string {
   return hashTx(canonicalTxPayload(tx));
+}
+
+/** The head of the chain: enough to notice later that the tail was cut off or rewritten. */
+export interface Checkpoint {
+  seq: number;
+  hash: string;
+}
+
+/** A row that may hash correctly and still break a ledger rule. `seq` is null when not row-specific. */
+export interface Violation {
+  seq: number | null;
+  reason: string;
+}
+
+export type CheckpointStatus = 'none' | 'ok' | 'truncated' | 'rewritten';
+
+/** The checkpoint of a chain, or null when it is empty. */
+export function headOf(txs: readonly Tx[]): Checkpoint | null {
+  let head: Tx | undefined;
+  for (const tx of txs) if (head === undefined || tx.seq > head.seq) head = tx;
+  return head === undefined ? null : { seq: head.seq, hash: head.hash };
+}
+
+/**
+ * Does this chain still agree with a checkpoint taken earlier? A chain shorter than the
+ * checkpoint was truncated; a different hash at the checkpoint's seq was rewritten. Neither is
+ * visible to the hash chain alone: a valid chain can be cut at any point and still verify.
+ */
+export function compareCheckpoint(txs: readonly Tx[], checkpoint: Checkpoint): CheckpointStatus {
+  const at = txs.find((tx) => tx.seq === checkpoint.seq);
+  if (at === undefined) return 'truncated';
+  return at.hash === checkpoint.hash ? 'ok' : 'rewritten';
+}
+
+/**
+ * Ledger rules a correctly hashed row can still break (someone with database access can
+ * recompute hashes): amounts positive, mint has no source, burn no destination, transfer both
+ * and distinct, every wallet known, memo well-formed, no reused nonce/key, and no wallet ever
+ * spending more than it held. `wallets` is the set of wallet ids that exist.
+ */
+export function verifyStructure(txs: readonly Tx[], wallets: ReadonlySet<string>): Violation[] {
+  const ordered = [...txs].sort((a, b) => a.seq - b.seq);
+  const violations: Violation[] = [];
+  const balances = new Map<string, bigint>();
+  const nonces = new Set<string>();
+  const keys = new Set<string>();
+
+  for (const tx of ordered) {
+    const bad = (reason: string): void => {
+      violations.push({ seq: tx.seq, reason });
+    };
+
+    if (typeof tx.amount !== 'bigint' || tx.amount <= 0n) bad('amount must be a positive bigint');
+    if (tx.kind === 'mint') {
+      if (tx.from !== null) bad('a mint must have no source wallet');
+      if (tx.to === null) bad('a mint must have a destination wallet');
+    } else if (tx.kind === 'burn') {
+      if (tx.from === null) bad('a burn must have a source wallet');
+      if (tx.to !== null) bad('a burn must have no destination wallet');
+    } else if (tx.kind === 'transfer') {
+      if (tx.from === null || tx.to === null) bad('a transfer needs both wallets');
+      else if (tx.from === tx.to) bad('a transfer cannot be to the same wallet');
+    } else {
+      bad(`unknown kind ${JSON.stringify(String(tx.kind))}`);
+    }
+    for (const id of [tx.from, tx.to]) {
+      if (id !== null && !wallets.has(id)) bad(`references unknown wallet ${id}`);
+    }
+    try {
+      validateMemo(tx.memo);
+    } catch (error) {
+      bad(`memo invalid: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const nonce = tx.memo?.nonce;
+    if (nonce !== undefined) {
+      if (nonces.has(nonce)) bad(`nonce ${JSON.stringify(nonce)} reused`);
+      nonces.add(nonce);
+    }
+    const key = tx.memo?.key;
+    if (key !== undefined) {
+      if (keys.has(key)) bad(`key ${JSON.stringify(key)} reused`);
+      keys.add(key);
+    }
+
+    if (typeof tx.amount === 'bigint') {
+      if (tx.from !== null) {
+        const held = balances.get(tx.from) ?? 0n;
+        if (held < tx.amount) bad(`wallet ${tx.from} spends ${tx.amount} but held ${held}`);
+        balances.set(tx.from, held - tx.amount);
+      }
+      if (tx.to !== null) balances.set(tx.to, (balances.get(tx.to) ?? 0n) + tx.amount);
+    }
+  }
+
+  for (const [id, balance] of balances) {
+    if (balance < 0n) violations.push({ seq: null, reason: `wallet ${id} ends with a negative balance` });
+  }
+  return violations;
 }
 
 /**
