@@ -595,3 +595,32 @@ describe('SqliteBackend — close, reopen, continue', () => {
     await backend.close();
   });
 });
+
+describe('SqliteBackend — verifyIntegrity never throws on odd stored types', () => {
+  test('BLOB keys in the replay guards, wallets or balances are violations, not exceptions', async () => {
+    const cases = [
+      "INSERT INTO nonces (nonce, tx_id, created_at) VALUES (x'00ff', 'x', 'now')",
+      "INSERT INTO memo_keys (key, tx_id, created_at) VALUES (x'00ff', 'x', 'now')",
+      "INSERT INTO wallets (id, owner_id, address, pubkey, is_entity, created_at) VALUES (x'01', 'blob', 'a', 'p', 0, 'now')",
+      "INSERT INTO balances (wallet_id, amount) VALUES (x'02', '0')",
+    ];
+    for (const sql of cases) {
+      const { backend, path } = await populated();
+      tamper(path, (db) => db.exec(sql));
+      let report: IntegrityReport | undefined;
+      await assert.doesNotReject(async () => {
+        report = await backend.verifyIntegrity();
+      }, sql);
+      assert.ok(report !== undefined && report.ok === false, sql);
+      await backend.close();
+    }
+  });
+
+  test('the check leaves no transaction open, so writes work straight afterwards', async () => {
+    const { backend, alice } = await populated();
+    await backend.verifyIntegrity();
+    await backend.mint(alice.id, 1n, { intent: 'X', nonce: 'after-verify' });
+    assert.equal((await backend.verifyIntegrity()).ok, true);
+    await backend.close();
+  });
+});

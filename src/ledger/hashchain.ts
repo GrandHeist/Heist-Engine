@@ -65,7 +65,7 @@ export const MAX_MEMO_KEY = 200;
 export const MAX_MEMO_META_ENTRIES = 8;
 export const MAX_MEMO_META_VALUE = 128;
 
-const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
+export const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
 const META_KEY = /^[a-z][A-Za-z0-9_]{0,31}$/;
 
 function checkText(value: unknown, field: string, max: number, allowEmpty: boolean): void {
@@ -73,6 +73,8 @@ function checkText(value: unknown, field: string, max: number, allowEmpty: boole
   if (value.length === 0 && !allowEmpty) throw new InvalidIntent(`${field} must not be empty`);
   if (value.length > max) throw new InvalidIntent(`${field} must be at most ${max} characters`);
   if (CONTROL_CHARS.test(value)) throw new InvalidIntent(`${field} must not contain control characters`);
+  // A lone UTF-16 surrogate is stored by sqlite as U+FFFD, so two different strings would collide there.
+  if (!value.isWellFormed()) throw new InvalidIntent(`${field} must be well-formed Unicode`);
 }
 
 export function validateMemo(memo: unknown): asserts memo is Memo {

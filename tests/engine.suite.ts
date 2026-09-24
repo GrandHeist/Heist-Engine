@@ -662,6 +662,77 @@ export function engineSuite(factory: BackendFactory): void {
     });
   });
 
+  describe(`EconomyEngine — ids and nonces the ledger cannot store faithfully [${factory.label}]`, () => {
+    const wallets = async (): Promise<number> => (await backend.listWallets()).filter((w) => !w.isEntity).length;
+
+    test('lone surrogates are rejected in ids and nonces, and the ledger still verifies', async () => {
+      for (const actor of ['x\ud800', '\udc00y']) {
+        expectFail(await engine.submit({ type: 'OpenAccount', nonce: nonce('s'), actor }), 'INVALID_INTENT');
+      }
+      expectFail(await engine.submit({ type: 'OpenAccount', nonce: 'ok\ud800', actor: 'p1' }), 'INVALID_INTENT');
+      assert.equal(await wallets(), 0);
+      await openAccount('p1');
+      assert.equal((await backend.verifyIntegrity()).ok, true);
+    });
+
+    test('one player cannot collect several grants through look-alike ids', async () => {
+      await openAccount('café'); // NFC
+      for (const actor of ['cafe\u0301', 'alice\u200b', 'a\u0085b', 'a\u2028b']) {
+        expectFail(await engine.submit({ type: 'OpenAccount', nonce: nonce('n'), actor }), 'INVALID_INTENT');
+      }
+      assert.equal(await wallets(), 1);
+    });
+
+    test('a rejected OpenAccount leaves no orphan wallet behind', async () => {
+      for (const n of ['n'.repeat(129), 'bad\nnonce', ' ']) {
+        expectFail(await engine.submit({ type: 'OpenAccount', nonce: n, actor: 'p1' }), 'INVALID_INTENT');
+      }
+      assert.equal(await wallets(), 0, 'no wallet may exist for a grant the ledger refused');
+    });
+  });
+
+  describe(`EconomyEngine — serialization is load-bearing [${factory.label}]`, () => {
+    test('concurrent retries of one nonce: one settles, the rest are replays of it', async () => {
+      await openAccount('player-1');
+      await openAccount('player-2');
+      const intent: Intent = { type: 'Transfer', nonce: 'same', actor: 'player-1', to: 'player-2', amount: '10' };
+      const results = await Promise.all(Array.from({ length: 5 }, () => engine.submit(intent)));
+      assert.ok(results.every((r) => r.ok), 'every retry is an ok (first or replayed), none a DUPLICATE_NONCE');
+      assert.equal(results.filter((r) => r.ok && r.replayed !== true).length, 1);
+      assert.equal(new Set(results.map((r) => (r.ok ? r.txId : ''))).size, 1);
+      assert.equal(await balanceOf('player-1'), WELCOME_GRANT - 10n);
+    });
+
+    test('concurrent transfers that together overdraw: exactly the affordable ones settle', async () => {
+      await openAccount('player-1');
+      await openAccount('player-2');
+      const results = await Promise.all(
+        Array.from({ length: 8 }, () =>
+          engine.submit({ type: 'Transfer', nonce: nonce('t'), actor: 'player-1', to: 'player-2', amount: '100' }),
+        ),
+      );
+      assert.equal(results.filter((r) => r.ok).length, 5);
+      for (const r of results.filter((r) => !r.ok)) assert.equal(r.code, 'INSUFFICIENT_FUNDS');
+      assert.equal(await balanceOf('player-1'), 0n);
+    });
+  });
+
+  describe(`EconomyEngine — only a real rental counts [${factory.label}]`, () => {
+    test('a RentVehicle-shaped payment to the wrong entity, or with the wrong intent, is not a rental', async () => {
+      await openAccount('player-1');
+      const player = await backend.getWalletByOwner('player-1');
+      const hospital = await backend.getWalletByOwner('hospital');
+      const rentalCo = await backend.getWalletByOwner(RENTAL_ENTITY);
+      assert.ok(player !== null && hospital !== null && rentalCo !== null);
+      await fundEntity(RENTAL_ENTITY, 1000n);
+      const meta = { vehicle: 'bike', minutes: '10' };
+      const wrongPayee = await backend.transfer(player.id, hospital.id, 10n, { intent: 'RentVehicle', nonce: nonce('a'), meta });
+      const wrongIntent = await backend.transfer(player.id, rentalCo.id, 10n, { intent: 'BuyService', nonce: nonce('b'), meta });
+      expectFail(await giveBack('player-1', wrongPayee.txId, 5), 'UNKNOWN_RENTAL');
+      expectFail(await giveBack('player-1', wrongIntent.txId, 5), 'UNKNOWN_RENTAL');
+    });
+  });
+
   describe(`EconomyEngine — Theft authorization [${factory.label}]`, () => {
     async function steal(authorizedBy: string, actor = 'robber'): Promise<EngineResponse> {
       return await engine.submit({

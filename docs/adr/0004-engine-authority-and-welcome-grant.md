@@ -21,10 +21,17 @@ that can reach `submit`) without breaking a single ledger invariant:
 
 ### 1. The welcome grant is a mint, paid once per owner
 
-`OpenAccount` pays the grant only if the owner has no ledger history. Repeats return
-`ACCOUNT_EXISTS` (typed, carries the address). A wallet with **no** history is an interrupted open
-(wallet row written, mint not) and is completed rather than stranded. Repeat and concurrent calls are
-serialized by the engine mutex (`src/engine/mutex.ts`), so the check cannot race.
+`OpenAccount` pays the grant only if the ledger has not already recorded one for this owner. The mint
+carries the key `welcome:<ownerId>` (`Memo.key`, ADR 0005) and a backend accepts a key exactly once,
+atomically, so repeats return `ACCOUNT_EXISTS` (typed, carries the address) even across restarts. A
+wallet whose mint never landed (interrupted open) simply gets the grant on the next call, whatever else
+has happened to it since. The engine mutex (`src/engine/mutex.ts`) serializes concurrent calls.
+(An earlier draft of this ADR used a "wallet has no history" rule; it was replaced by the key.)
+
+"Once per owner" means once per **owner id string**. Ids must be NFC-normalized and free of control,
+invisible (format) and lone-surrogate characters, so look-alike encodings of one name cannot collect
+several grants. Case is significant (`Alice` and `alice` are different owners), so adapters must pass a
+stable account identifier (licence, Steam id), never a name a player can type.
 
 **Why a mint and not a transfer from `treasury`.** SPEC line 154 lists `treasury` as the payer. We looked
 at making it a real transfer and did not, because:

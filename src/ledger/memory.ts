@@ -122,8 +122,8 @@ export class MemoryBackend implements LedgerBackend {
     key: WalletKeyInfo,
     opts?: CreateWalletOptions,
   ): Promise<Wallet> {
-    if (typeof ownerId !== 'string' || ownerId.length === 0) {
-      throw new InvalidIntent('ownerId must be a non-empty string');
+    if (typeof ownerId !== 'string' || ownerId.length === 0 || !ownerId.isWellFormed()) {
+      throw new InvalidIntent('ownerId must be a non-empty, well-formed string');
     }
     if (key === null || typeof key !== 'object') {
       throw new InvalidIntent('key must be a WalletKeyInfo');

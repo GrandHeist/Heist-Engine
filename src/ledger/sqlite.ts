@@ -180,6 +180,19 @@ function readAmount(row: Record<string, SQLOutputValue>, column: string, min: bi
   }
 }
 
+/** A TEXT column read for verification: a non-text value is reported as a violation, never thrown. */
+function textOrViolation(
+  row: Record<string, SQLOutputValue>,
+  column: string,
+  violations: Violation[],
+  what: string,
+): string | null {
+  const value = row[column];
+  if (typeof value === 'string') return value;
+  violations.push({ seq: null, reason: `${what} is not TEXT (got ${typeof value})` });
+  return null;
+}
+
 function isTxKind(value: string): value is TxKind {
   return value === 'transfer' || value === 'mint' || value === 'burn';
 }
@@ -300,8 +313,8 @@ export class SqliteBackend implements LedgerBackend {
     opts?: CreateWalletOptions,
   ): Promise<Wallet> {
     const db = this.database();
-    if (typeof ownerId !== 'string' || ownerId.length === 0) {
-      throw new InvalidIntent('ownerId must be a non-empty string');
+    if (typeof ownerId !== 'string' || ownerId.length === 0 || !ownerId.isWellFormed()) {
+      throw new InvalidIntent('ownerId must be a non-empty, well-formed string');
     }
     // A wallet with no pubkey/address is one nothing can ever sign for — see the WalletKeyInfo
     // doc comment in backend.ts. Reject before anything is persisted.
@@ -580,6 +593,22 @@ export class SqliteBackend implements LedgerBackend {
    *   5. optionally, a checkpoint kept outside the database (truncation / rewritten tail).
    */
   async verifyIntegrity(expected?: Checkpoint): Promise<IntegrityReport> {
+    // One read transaction, so a writer committing in another process cannot land between the
+    // separate SELECTs and show up as a false balance mismatch.
+    const db = this.database();
+    db.exec('BEGIN');
+    try {
+      return this.verifyIntegrityInTx(expected);
+    } finally {
+      try {
+        db.exec('COMMIT');
+      } catch {
+        // nothing to release
+      }
+    }
+  }
+
+  private verifyIntegrityInTx(expected?: Checkpoint): IntegrityReport {
     const db = this.database();
     const rows = db.prepare('SELECT * FROM transactions ORDER BY seq ASC').all();
 
@@ -603,7 +632,8 @@ export class SqliteBackend implements LedgerBackend {
 
     const walletIds = new Set<WalletId>();
     for (const walletRow of db.prepare('SELECT id FROM wallets').all()) {
-      walletIds.add(readText(walletRow, 'id'));
+      const id = textOrViolation(walletRow, 'id', violations, 'wallets.id');
+      if (id !== null) walletIds.add(id);
     }
     violations.push(...verifyStructure(txs, walletIds));
 
@@ -619,7 +649,8 @@ export class SqliteBackend implements LedgerBackend {
     const stored = new Map<WalletId, bigint>();
     const undecodable = new Set<WalletId>();
     for (const row of db.prepare('SELECT wallet_id, amount FROM balances').all()) {
-      const id = readText(row, 'wallet_id');
+      const id = textOrViolation(row, 'wallet_id', violations, 'balances.wallet_id');
+      if (id === null) continue;
       try {
         stored.set(id, readAmount(row, 'amount', 0n));
       } catch (error) {
@@ -672,7 +703,9 @@ export class SqliteBackend implements LedgerBackend {
     for (const guard of guards) {
       const recorded = new Map<string, string>();
       for (const row of db.prepare(`SELECT ${guard.column} AS k, tx_id FROM ${guard.table}`).all()) {
-        recorded.set(readText(row, 'k'), readText(row, 'tx_id'));
+        const k = textOrViolation(row, 'k', out, `${guard.table} key`);
+        const txId = textOrViolation(row, 'tx_id', out, `${guard.table}.tx_id`);
+        if (k !== null && txId !== null) recorded.set(k, txId);
       }
       for (const tx of txs) {
         const value = guard.of(tx);

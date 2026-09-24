@@ -44,6 +44,7 @@ import {
 } from '../config/config.ts';
 import type { HeistConfig } from '../config/config.ts';
 import type { LedgerBackend, WalletKeyInfo } from '../ledger/backend.ts';
+import { CONTROL_CHARS, validateMemo } from '../ledger/hashchain.ts';
 import type { Custody } from './custody.ts';
 import { Mutex } from './mutex.ts';
 import type {
@@ -232,7 +233,7 @@ export class EconomyEngine {
     if (intent === null || typeof intent !== 'object') {
       throw new InvalidIntent('Intent must be an object');
     }
-    assertNonEmpty(intent.nonce, 'nonce');
+    assertNonce(intent.nonce);
     assertNonEmpty(intent.actor, 'actor');
 
     // Ask the backend — the single source of truth for replay — before doing any
@@ -292,14 +293,18 @@ export class EconomyEngine {
     this.#assertPlayerId(intent.actor, 'actor');
     const existing = await this.#backend.getWalletByOwner(intent.actor);
     if (existing?.isEntity === true) throw new NotAuthorized(`"${intent.actor}" is an entity account`);
+    // Validate the whole memo BEFORE creating a wallet: a grant the ledger will refuse must not
+    // leave an orphan wallet behind.
+    const memo: Memo = {
+      ...this.#memo(intent, `welcome grant from ${this.#displayName(TREASURY_ID)}`),
+      key: `welcome:${intent.actor}`,
+    };
+    validateMemo(memo);
     const player = existing ?? (await this.#ensureWallet(intent.actor, false));
 
     let ref;
     try {
-      ref = await this.#backend.mint(player.id, amount, {
-        ...this.#memo(intent, `welcome grant from ${this.#displayName(TREASURY_ID)}`),
-        key: `welcome:${intent.actor}`,
-      });
+      ref = await this.#backend.mint(player.id, amount, memo);
     } catch (cause) {
       if (cause instanceof DuplicateKey) throw new AccountExists(intent.actor, player.address);
       throw cause;
@@ -683,10 +688,13 @@ function assertOwnerId(value: unknown, field: string): void {
     value.length === 0 ||
     value.length > 128 ||
     value !== value.trim() ||
-    /[\u0000-\u001f\u007f]/.test(value)
+    CONTROL_CHARS.test(value) ||
+    /\p{Cf}/u.test(value) || // zero-width and other invisible format characters
+    !value.isWellFormed() ||
+    value !== value.normalize('NFC') // "café" typed two ways is one id, not two grants
   ) {
     throw new InvalidIntent(
-      `${field} must be a 1-128 character id with no leading/trailing whitespace or control characters`,
+      `${field} must be a 1-128 character NFC-normalized id with no padding, control or invisible characters`,
     );
   }
 }
@@ -698,7 +706,8 @@ function assertName(value: unknown, field: string): void {
     value.length === 0 ||
     value.length > 64 ||
     value !== value.trim() ||
-    /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/.test(value)
+    CONTROL_CHARS.test(value) ||
+    !value.isWellFormed()
   ) {
     throw new InvalidIntent(`${field} must be 1-64 characters, single-line, with no padding`);
   }
@@ -716,6 +725,19 @@ function cleanReason(raw: unknown): string | undefined {
     .trim();
   if (flat === '') return undefined;
   return flat.length > MAX_REASON ? `${flat.slice(0, MAX_REASON - 1)}…` : flat;
+}
+
+/** Same rules the ledger applies to memo.nonce, checked up front so nothing is written first. */
+function assertNonce(value: unknown): void {
+  if (
+    typeof value !== 'string' ||
+    value.trim() === '' ||
+    value.length > 128 ||
+    CONTROL_CHARS.test(value) ||
+    !value.isWellFormed()
+  ) {
+    throw new InvalidIntent('nonce must be a 1-128 character single-line string');
+  }
 }
 
 function assertNonEmpty(value: string, field: string): void {

@@ -36,7 +36,8 @@ trusting far more than that:
 
 ### Verification (every backend, via `hashchain.ts`)
 
-`verifyIntegrity(expected?)` reports, and never throws on tampered data:
+`verifyIntegrity(expected?)` runs in one read transaction and reports, without throwing on odd stored
+types (BLOB keys, wrong column types) in the tables it reads:
 
 1. hash and `prevHash` linkage (`brokenAt`);
 2. `violations`: rules a *re-hashed* row can still break — amount > 0, mint/burn/transfer shape, known
@@ -70,6 +71,7 @@ latest head in `<db>.head` and checks against it on every start.
 | Tail deleted, balances left alone | balance fold |
 | **Tail deleted (or history rewritten), everything made self-consistent** | **only a checkpoint stored outside the ledger** |
 | **Forged rows appended to the end, valid hashes, balances updated** | **nothing yet** (needs signatures; ADR 0003) |
+| **Edits to the `wallets` table (swap `owner_id`s, rewrite `pubkey`/`address`) or to a tx `id` together with its `nonces` row** | **nothing yet.** The hash covers a row's payload, not its `id`, and nothing hashes the wallet registry. Needs signed wallet-registration rows or an owner manifest (ADR 0003) |
 
 Two honest limits:
 
