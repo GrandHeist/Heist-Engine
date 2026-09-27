@@ -23,7 +23,7 @@ sides:
 The design below fixes them in that dependency order: keys must persist before rows can be signed, and
 rows should be signed before the adapter surface is exposed on a network.
 
-Constraints carried over from the workspace rules: this is an **off-chain signing scheme for a
+Constraints carried over from the project rules: this is an **off-chain signing scheme for a
 non-redeemable in-game currency, not a wallet**. The on-chain custody guard (`ONCHAIN_CUSTODY_BLOCKED`)
 stays exactly as it is; nothing here relaxes it, and keys created for this scheme must never be reused
 on any chain. Only the maintainer writes the key-handling code.
@@ -186,7 +186,7 @@ produce must reproduce the stored `pubkey`, otherwise refuse to start.
    - Per-wallet keys, and the SPEC's original "encrypted KV" plan. Revocation and rotation are natural.
    - The master key still has to live somewhere; you now also back up and restore a store, and losing
      the store loses signing for every wallet it held.
-3. **Plaintext key files, `chmod 600`, git-ignored.** Matches the workspace rule for dev material.
+3. **Plaintext key files, `chmod 600`, git-ignored.** Matches the project rule for dev material.
    Acceptable for a dev machine only: no protection if the disk or a backup leaks.
 4. **One ledger authority key, no per-wallet keys.** Because the server signs for everyone anyway,
    per-wallet keys add little on an off-chain ledger.
