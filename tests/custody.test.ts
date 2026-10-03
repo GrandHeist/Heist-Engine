@@ -43,12 +43,8 @@ describe('Custody — the on-chain guard', () => {
     throwsWithCode(() => new Custody('solana'), 'ONCHAIN_CUSTODY_BLOCKED');
   });
 
-  test('constructing Custody for bsc throws ONCHAIN_CUSTODY_BLOCKED', () => {
-    throwsWithCode(() => new Custody('bsc'), 'ONCHAIN_CUSTODY_BLOCKED');
-  });
-
   test('every backend listed as on-chain is refused, and no other', () => {
-    assert.deepEqual([...ONCHAIN_BACKENDS].sort(), ['bsc', 'solana']);
+    assert.deepEqual([...ONCHAIN_BACKENDS].sort(), ['solana']);
 
     for (const backend of ONCHAIN_BACKENDS) {
       assert.equal(isOnchain(backend), true);

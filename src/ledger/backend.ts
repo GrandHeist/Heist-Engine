@@ -1,5 +1,5 @@
 // The one interface every ledger backend implements. Postgres, SQLite, memory,
-// Solana and BNB Chain all sit behind exactly this — that swappability is the
+// and Solana all sit behind exactly this — that swappability is the
 // whole architectural bet, so nothing may leak backend specifics through it.
 
 import type { Memo, Tx, TxRef, Wallet, WalletId, OwnerId } from '../types.ts';
@@ -7,7 +7,7 @@ import type { Checkpoint, CheckpointStatus, Violation } from './hashchain.ts';
 
 export type { Checkpoint, CheckpointStatus, Violation };
 
-export type BackendName = 'memory' | 'sqlite' | 'postgres' | 'solana' | 'bsc';
+export type BackendName = 'memory' | 'sqlite' | 'postgres' | 'solana';
 
 export interface CreateWalletOptions {
   isEntity?: boolean;

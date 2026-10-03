@@ -17,7 +17,7 @@ The in-game currency is **HD** — Heist Dollars.
 | **SQLite** ledger backend (`node:sqlite`, file-backed, hash-chained, tamper-checked) | **works** |
 | Standalone CLI simulator (`npm run sim`) | **works** |
 | **Postgres** backend | *not written.* It is a valid name in config and is refused at startup |
-| **Solana / BNB Chain** backends | *not written, and gated on purpose.* Custody refuses on-chain modes until a human signs off (see `src/engine/custody.ts`) |
+| **Solana** backend | *not written, and gated on purpose.* Custody refuses on-chain modes until a human signs off (see `src/engine/custody.ts`) |
 | **Signed transactions** | *designed, not implemented.* Ledger rows are hash-chained but their `signature` column is empty. See [ADR 0003](docs/adr/0003-signing-design.md) |
 | **Adapter authentication**, HTTP/WS server | *not written.* The engine is a library; only the CLI drives it |
 | **FiveM** (Lua) and **RageMP** (JS) adapters | *not written* |

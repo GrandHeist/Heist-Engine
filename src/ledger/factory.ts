@@ -10,7 +10,7 @@ import { SqliteBackend } from './sqlite.ts';
 /**
  * The backend for `config.backend`. Not yet initialised: the engine's `init()` does that.
  *
- * Only `memory` and `sqlite` exist. `postgres`, `solana` and `bsc` are valid names in config (so
+ * Only `memory` and `sqlite` exist. `postgres` and `solana` are valid names in config (so
  * the file format does not change when they land) but are refused here with a typed error, never
  * silently downgraded to something that would keep data in the wrong place.
  */
@@ -25,7 +25,6 @@ export function createBackend(config: HeistConfig): LedgerBackend {
       return new SqliteBackend(config.dbPath);
     case 'postgres':
     case 'solana':
-    case 'bsc':
       throw new EngineError(
         'BACKEND_UNAVAILABLE',
         `backend "${config.backend}" is not implemented. Available: memory, sqlite.`,

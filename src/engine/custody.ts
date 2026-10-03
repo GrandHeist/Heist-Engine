@@ -19,9 +19,9 @@
 //     which the hash chain makes detectable. This is a SIGNING SCHEME, NOT A
 //     WALLET.
 //
-//   * ON-CHAIN MODE ('solana' | 'bsc') is BLOCKED, deliberately and
+//   * ON-CHAIN MODE ('solana') is BLOCKED, deliberately and
 //     permanently until a human says otherwise. There, the identical keypair
-//     would control real transferable on-chain assets — SPL tokens or ERC-20 —
+//     would control real transferable on-chain assets — SPL tokens —
 //     and the engine would be a custodian of bearer instruments for every
 //     player on the server. That is real private-key custody. It is not a
 //     thing this agent gets to switch on.
@@ -59,7 +59,7 @@ import type { OwnerId } from '../types.ts';
 export const ONCHAIN_CUSTODY_BLOCKED = true;
 
 /** Backends for which key generation is refused outright. */
-export const ONCHAIN_BACKENDS: readonly BackendName[] = ['solana', 'bsc'];
+export const ONCHAIN_BACKENDS: readonly BackendName[] = ['solana'];
 
 /** Prefix on every derived address, so an HD address is recognisable on sight. */
 const ADDRESS_PREFIX = 'HD';

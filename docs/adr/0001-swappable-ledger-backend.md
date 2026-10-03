@@ -2,11 +2,12 @@
 
 Date: 2026-07-21
 Status: Accepted — **amended 2026-09-24**: only two of the three backends were built; the Postgres
-sections below describe intent, not code. Corrections are marked *Amended*.
+sections below describe intent, not code. **Amended 2026-10-03**: BNB Chain dropped from scope —
+Solana only, for now. Corrections are marked *Amended*.
 
 ## Context
 
-`docs/SPEC.md` names Postgres as the default backend, with Solana and BNB Chain gated behind a config
+`docs/SPEC.md` names Postgres as the default backend, with Solana gated behind a config
 flag pending platform approval. The swappability itself is the architectural bet: every backend sits
 behind one `LedgerBackend` interface, and the game adapter cannot tell them apart.
 
@@ -29,8 +30,10 @@ Put every ledger behind the single interface. The planned order was three off-ch
    refuses it with `BACKEND_UNAVAILABLE`. The `optionalDependencies.pg` entry in `package.json` is
    unused and can be dropped until this is built.
 
-Solana and BNB Chain remain unimplemented and gated, per the spec. Custody refuses to construct for
-them (`ONCHAIN_CUSTODY_BLOCKED`); enabling either takes an ADR and human sign-off, not a config change.
+Solana remains unimplemented and gated, per the spec. Custody refuses to construct for
+it (`ONCHAIN_CUSTODY_BLOCKED`); enabling it takes an ADR and human sign-off, not a config change.
+*Amended 2026-10-03:* BNB Chain was dropped from scope entirely, not just deprioritised — it is no
+longer a valid `BackendName`, config value, or `ONCHAIN_BACKENDS` entry. Solana only, for now.
 
 ## Consequences
 

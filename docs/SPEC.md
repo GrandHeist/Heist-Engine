@@ -7,7 +7,7 @@
 
 ## What it is
 
-A plugin that replaces a GTA RP server's in-game economy with a transparent, auditable ledger of player and NPC-entity wallets. Players spawn with a wallet, and every economic action (rent a bike, pay hospital, get paid for a job, fines, robberies) is a transfer, mint or burn on that ledger. The ledger backend is swappable behind one interface. Today two backends exist: **memory** and **SQLite** (both off-chain). A **Postgres** backend is planned but not written. **Solana / BNB Chain** backends are planned, deliberately blocked, and are not a config flag (see below).
+A plugin that replaces a GTA RP server's in-game economy with a transparent, auditable ledger of player and NPC-entity wallets. Players spawn with a wallet, and every economic action (rent a bike, pay hospital, get paid for a job, fines, robberies) is a transfer, mint or burn on that ledger. The ledger backend is swappable behind one interface. Today two backends exist: **memory** and **SQLite** (both off-chain). A **Postgres** backend is planned but not written. A **Solana** backend is planned, deliberately blocked, and is not a config flag (see below).
 
 This is a private friends server. No real-money entry/exit, no sale of HD, no advertised public listing. HD = "Heist Dollar," the only currency in the world.
 
@@ -19,7 +19,7 @@ This is a private friends server. No real-money entry/exit, no sale of HD, no ad
 | Memory + SQLite backends, hash chain, integrity verification, checkpoints | **[built]** |
 | Standalone CLI simulator | **[built]** |
 | Postgres backend | **[planned]**, not written |
-| Solana / BNB Chain backends | **[planned]**, blocked by Custody until an ADR + human sign-off |
+| Solana backend | **[planned]**, blocked by Custody until an ADR + human sign-off |
 | Signed ledger rows (payer key signs each tx) | **[planned]**, designed in [ADR 0003](adr/0003-signing-design.md); `signature` is always null today |
 | Adapter authentication, HTTP/WS surface | **[planned]**, designed in ADR 0003; the engine is a library today |
 | FiveM / RageMP adapters | **[planned]**, not written |
@@ -68,7 +68,7 @@ This is a private friends server. No real-money entry/exit, no sale of HD, no ad
 ┌─────────────────────────────────────────────────────────────┐
 │ Ledger Backend (swappable, single interface)                │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐   │
-│  │ memory+sqlite│  │  Postgres    │  │ Solana / BNB     │   │
+│  │ memory+sqlite│  │  Postgres    │  │     Solana       │   │
 │  │   [built]    │  │  [planned]   │  │ [planned,blocked]│   │
 │  └──────────────┘  └──────────────┘  └──────────────────┘   │
 └─────────────────────────────────────────────────────────────┘
@@ -148,7 +148,7 @@ Backends receive only the *public* half of a wallet's keypair; they never genera
 
 **Postgres backend** [planned, not written]: the same SQL shape as SQLite, using the `pg` package. A `postgres` config value is accepted by the loader and refused at startup.
 
-**Solana backend** [planned, blocked]: HD as an SPL token, server multisig mint authority, server-custodied player keypairs. **BNB Chain backend** [planned, blocked]: ERC-20 HD, Gnosis Safe mint authority. Both would make the engine a custodian of real transferable on-chain assets, which is what `Custody` refuses (`ONCHAIN_CUSTODY_BLOCKED`). Turning either on requires: a backend implementation, an ADR covering key generation / encryption / recovery / blast radius, and explicit human sign-off. It is not a config flag.
+**Solana backend** [planned, blocked]: HD as an SPL token, server multisig mint authority, server-custodied player keypairs. This would make the engine a custodian of real transferable on-chain assets, which is what `Custody` refuses (`ONCHAIN_CUSTODY_BLOCKED`). Turning it on requires: a backend implementation, an ADR covering key generation / encryption / recovery / blast radius, and explicit human sign-off. It is not a config flag.
 
 ## Entity wallets (NPC accounts) — [built]
 
@@ -207,7 +207,7 @@ The real format is JSON (`heist.config.json`, validated at load; there is no YAM
 }
 ```
 
-Money values are quoted decimal strings, never JSON numbers, and zero prices are rejected. `backend` is `memory` or `sqlite` today; `postgres`, `solana` and `bsc` are accepted names that fail at startup.
+Money values are quoted decimal strings, never JSON numbers, and zero prices are rejected. `backend` is `memory` or `sqlite` today; `postgres` and `solana` are accepted names that fail at startup.
 
 ## Why this design works for the company conversations
 
@@ -235,5 +235,4 @@ Money values are quoted decimal strings, never JSON numbers, and zero prices are
 4. RageMP JS adapter — same interaction, different framework.
 5. Postgres backend, if SQLite stops being enough.
 6. Solana backend behind explicit approval — same intents, real SPL transfers.
-7. BNB Chain backend behind explicit approval.
-8. Admin dashboard.
+7. Admin dashboard.

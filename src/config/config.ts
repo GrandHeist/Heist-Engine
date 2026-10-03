@@ -64,7 +64,7 @@ export interface HeistConfig {
 /** The entity that every economy must have: mint source and fine collector. */
 export const TREASURY_ID = 'treasury';
 
-const BACKEND_NAMES: readonly BackendName[] = ['memory', 'sqlite', 'postgres', 'solana', 'bsc'];
+const BACKEND_NAMES: readonly BackendName[] = ['memory', 'sqlite', 'postgres', 'solana'];
 
 const DEFAULT_CONFIG_FILENAME = 'heist.config.json';
 

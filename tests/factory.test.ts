@@ -26,7 +26,7 @@ describe('createBackend', () => {
   });
 
   test('backends that do not exist yet are refused, not downgraded', () => {
-    for (const backend of ['postgres', 'solana', 'bsc'] as BackendName[]) {
+    for (const backend of ['postgres', 'solana'] as BackendName[]) {
       assert.throws(
         () => createBackend({ ...defaultConfig(), backend }),
         (e: unknown) => e instanceof EngineError && e.code === 'BACKEND_UNAVAILABLE' && e.message.includes(backend),
