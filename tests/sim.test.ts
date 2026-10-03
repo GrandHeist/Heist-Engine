@@ -10,9 +10,22 @@ import { after, describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { defaultConfig } from '../src/config/config.ts';
+import { PostgresBackend } from '../src/ledger/postgres.ts';
 
 const dir = mkdtempSync(join(tmpdir(), 'heist-sim-'));
 after(() => rmSync(dir, { recursive: true, force: true }));
+
+// Same real-or-skip rule as the conformance suite (tests/conformance.test.ts): no mock postgres.
+const CANDIDATE_PG_URL = process.env['TEST_DATABASE_URL'] ?? 'postgres://localhost/heist_engine_test';
+let PG_URL: string | undefined;
+try {
+  const probe = new PostgresBackend(CANDIDATE_PG_URL);
+  await probe.init();
+  await probe.close();
+  PG_URL = CANDIDATE_PG_URL;
+} catch {
+  PG_URL = undefined;
+}
 
 function sim(args: string[], input: string): { code: number | null; out: string } {
   const run = spawnSync(process.execPath, ['src/cli/sim.ts', ...args], { input, encoding: 'utf8' });
@@ -56,10 +69,29 @@ describe('sim — config wiring', () => {
   });
 
   test('a config naming a backend that does not exist yet is refused', () => {
+    const path = configFile('bsc.json', { ...defaultConfig(), backend: 'solana' });
+    const { code, out } = sim([`--config=${path}`], 'exit\n');
+    assert.equal(code, 1, out);
+    assert.match(out, /startup failed: backend "solana" is not implemented/);
+  });
+
+  test('postgres without a databaseUrl is refused at config load, before the backend is ever built', () => {
     const path = configFile('pg.json', { ...defaultConfig(), backend: 'postgres' });
     const { code, out } = sim([`--config=${path}`], 'exit\n');
     assert.equal(code, 1, out);
-    assert.match(out, /startup failed: backend "postgres" is not implemented/);
+    assert.match(out, /startup failed: .*backend "postgres" requires databaseUrl/);
+  });
+
+  test('--backend=postgres --database-url= actually works end to end, against a real Postgres', { skip: !PG_URL }, () => {
+    const { code, out } = sim(
+      [`--backend=postgres`, `--database-url=${PG_URL}`],
+      'seed\nfund hospital 100\nbuy alice hospital_full_heal\nverify\nexit\n',
+    );
+    assert.equal(code, 0, out);
+    assert.match(out, /backend postgres/);
+    assert.match(out, /Account opened\. 500 HD welcome grant/);
+    assert.match(out, /Paid 200 HD to Pillbox Medical/);
+    assert.match(out, /chain OK/);
   });
 
   test('a missing config file is a clear startup error, not a stack trace', () => {

@@ -39,11 +39,23 @@ const PROMPT = 'heist> ';
 const DEMO_FUNDED_ENTITIES = ['treasury', 'bike-rental-co', 'taxi-co', 'pd-payroll'];
 const DEMO_FUNDING = '10000';
 
+/** host/db only, for a startup banner — a connection string can carry a password. */
+function redactedDatabaseUrl(url: string | undefined): string {
+  if (url === undefined) return '(no databaseUrl)';
+  try {
+    const parsed = new URL(url);
+    return `${parsed.hostname}${parsed.pathname}`;
+  } catch {
+    return '(unparseable databaseUrl)';
+  }
+}
+
 /** Command-line overrides. Anything left undefined comes from the config file. */
 interface SimOptions {
   configPath: string;
-  backend?: 'memory' | 'sqlite';
+  backend?: 'memory' | 'sqlite' | 'postgres';
   dbPath?: string;
+  databaseUrl?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -60,20 +72,24 @@ function parseArgs(argv: readonly string[]): SimOptions {
       options.configPath = value;
     } else if (arg.startsWith('--backend=')) {
       const value = arg.slice('--backend='.length);
-      if (value !== 'memory' && value !== 'sqlite') {
-        throw new Error(`--backend must be memory or sqlite, got "${value}"`);
+      if (value !== 'memory' && value !== 'sqlite' && value !== 'postgres') {
+        throw new Error(`--backend must be memory, sqlite or postgres, got "${value}"`);
       }
       options.backend = value;
     } else if (arg.startsWith('--db=')) {
       const value = arg.slice('--db='.length).trim();
       if (value === '') throw new Error('--db needs a path, e.g. --db=./heist.sqlite');
       options.dbPath = value;
+    } else if (arg.startsWith('--database-url=')) {
+      const value = arg.slice('--database-url='.length).trim();
+      if (value === '') throw new Error('--database-url needs a connection string, e.g. --database-url=postgres://localhost/heist');
+      options.databaseUrl = value;
     } else if (arg === '--help' || arg === '-h') {
       process.stdout.write(`${USAGE}\n`);
       process.exit(0);
     } else {
       throw new Error(
-        `Unknown option "${arg}". Try --config=<path> --backend=memory|sqlite --db=<path>`,
+        `Unknown option "${arg}". Try --config=<path> --backend=memory|sqlite|postgres --db=<path> --database-url=<url>`,
       );
     }
   }
@@ -265,7 +281,9 @@ class Simulator {
   banner(interactive: boolean): void {
     out(
       `heist-engine sim — backend ${this.#backend.name}` +
-        (this.#backend.name === 'sqlite' ? ` (${this.#config.dbPath ?? DEFAULT_DB_PATH})` : ''),
+        (this.#backend.name === 'sqlite' ? ` (${this.#config.dbPath ?? DEFAULT_DB_PATH})` : '') +
+        // Never print a connection string verbatim: it can carry a password. Host/db only.
+        (this.#backend.name === 'postgres' ? ` (${redactedDatabaseUrl(this.#config.databaseUrl)})` : ''),
     );
     out(
       `currency ${this.#config.currency}, welcome grant ` +
@@ -560,6 +578,7 @@ function buildConfig(options: SimOptions): HeistConfig {
   const merged: HeistConfig = { ...loadConfig(options.configPath) };
   if (options.backend !== undefined) merged.backend = options.backend;
   if (options.dbPath !== undefined) merged.dbPath = options.dbPath;
+  if (options.databaseUrl !== undefined) merged.databaseUrl = options.databaseUrl;
   if (merged.backend === 'sqlite' && merged.dbPath === undefined) merged.dbPath = DEFAULT_DB_PATH;
   return validateConfig(merged, 'sim options');
 }

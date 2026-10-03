@@ -15,8 +15,8 @@ The in-game currency is **HD** — Heist Dollars.
 | Economy engine (8 intents + an admin funding call), config-driven prices and entities | **works** |
 | **Memory** ledger backend (tests, dry runs) | **works** |
 | **SQLite** ledger backend (`node:sqlite`, file-backed, hash-chained, tamper-checked) | **works** |
+| **Postgres** ledger backend (`pg`, schema-isolated, same conformance suite as the other two) | **works** |
 | Standalone CLI simulator (`npm run sim`) | **works** |
-| **Postgres** backend | *not written.* It is a valid name in config and is refused at startup |
 | **Solana** backend | *not written, and gated on purpose.* Custody refuses on-chain modes until a human signs off (see `src/engine/custody.ts`) |
 | **Signed transactions** | *designed, not implemented.* Ledger rows are hash-chained but their `signature` column is empty. See [ADR 0003](docs/adr/0003-signing-design.md) |
 | **Adapter authentication**, HTTP/WS server | *not written.* The engine is a library; only the CLI drives it |
@@ -28,14 +28,21 @@ Everything else in the spec is design.
 
 ## Try it
 
-Node 24 or newer (`node:sqlite` is built in; there are no runtime dependencies).
+Node 24 or newer (`node:sqlite` is built in; there are no required runtime dependencies — `pg` is an
+optionalDependency, only needed for the Postgres backend).
 
 ```sh
-npm install        # dev dependencies only: typescript, @types/node
-npm run check      # typecheck + the full test suite
+npm install        # dev dependencies, plus pg for the postgres backend
+npm run check      # typecheck + the full test suite (needs a local Postgres — see below)
 npm run sim        # interactive simulator, in-memory ledger
-npm run sim -- --backend=sqlite --db=./heist.sqlite    # persistent ledger
+npm run sim -- --backend=sqlite --db=./heist.sqlite                          # persistent ledger
+npm run sim -- --backend=postgres --database-url=postgres://localhost/heist  # or Postgres
 ```
+
+The Postgres backend's conformance tests need a real local Postgres reachable at
+`TEST_DATABASE_URL` (defaults to `postgres://localhost/heist_engine_test`) — they run for real against
+it, not a mock, same as the sqlite tests run against a real file. If nothing is listening there, that
+one backend's conformance suite is skipped (reported in the test output) rather than failing the run.
 
 In the sim, `seed` funds the payout entities and opens two demo players; `help` lists the commands.
 The sim verifies the ledger on every start and refuses to run on one that fails. See

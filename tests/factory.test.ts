@@ -18,6 +18,17 @@ describe('createBackend', () => {
     await sqlite.close();
   });
 
+  test('postgres comes from the config too, given a databaseUrl', () => {
+    const postgres = createBackend({
+      ...defaultConfig(),
+      backend: 'postgres',
+      databaseUrl: 'postgres://localhost/does-not-need-to-exist-for-this-assertion',
+    });
+    assert.equal(postgres.name, 'postgres');
+    // Not init()'d here deliberately: constructing the backend must not touch the network.
+    // The conformance suite is what actually connects and exercises it against real Postgres.
+  });
+
   test('sqlite without a dbPath is a typed error', () => {
     assert.throws(
       () => createBackend({ ...defaultConfig(), backend: 'sqlite' }),
@@ -25,8 +36,15 @@ describe('createBackend', () => {
     );
   });
 
+  test('postgres without a databaseUrl is a typed error', () => {
+    assert.throws(
+      () => createBackend({ ...defaultConfig(), backend: 'postgres' }),
+      (e: unknown) => e instanceof EngineError && e.code === 'BACKEND_UNAVAILABLE',
+    );
+  });
+
   test('backends that do not exist yet are refused, not downgraded', () => {
-    for (const backend of ['postgres', 'solana'] as BackendName[]) {
+    for (const backend of ['solana'] as BackendName[]) {
       assert.throws(
         () => createBackend({ ...defaultConfig(), backend }),
         (e: unknown) => e instanceof EngineError && e.code === 'BACKEND_UNAVAILABLE' && e.message.includes(backend),

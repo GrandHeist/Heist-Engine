@@ -7,7 +7,7 @@
 
 ## What it is
 
-A plugin that replaces a GTA RP server's in-game economy with a transparent, auditable ledger of player and NPC-entity wallets. Players spawn with a wallet, and every economic action (rent a bike, pay hospital, get paid for a job, fines, robberies) is a transfer, mint or burn on that ledger. The ledger backend is swappable behind one interface. Today two backends exist: **memory** and **SQLite** (both off-chain). A **Postgres** backend is planned but not written. A **Solana** backend is planned, deliberately blocked, and is not a config flag (see below).
+A plugin that replaces a GTA RP server's in-game economy with a transparent, auditable ledger of player and NPC-entity wallets. Players spawn with a wallet, and every economic action (rent a bike, pay hospital, get paid for a job, fines, robberies) is a transfer, mint or burn on that ledger. The ledger backend is swappable behind one interface. Today three backends exist: **memory**, **SQLite** and **Postgres** (all off-chain). A **Solana** backend is planned, deliberately blocked, and is not a config flag (see below).
 
 This is a private friends server. No real-money entry/exit, no sale of HD, no advertised public listing. HD = "Heist Dollar," the only currency in the world.
 
@@ -16,9 +16,8 @@ This is a private friends server. No real-money entry/exit, no sale of HD, no ad
 | Piece | Status |
 |---|---|
 | Intent router, config, entity wallets, admin funding | **[built]** |
-| Memory + SQLite backends, hash chain, integrity verification, checkpoints | **[built]** |
+| Memory + SQLite + Postgres backends, hash chain, integrity verification, checkpoints | **[built]** |
 | Standalone CLI simulator | **[built]** |
-| Postgres backend | **[planned]**, not written |
 | Solana backend | **[planned]**, blocked by Custody until an ADR + human sign-off |
 | Signed ledger rows (payer key signs each tx) | **[planned]**, designed in [ADR 0003](adr/0003-signing-design.md); `signature` is always null today |
 | Adapter authentication, HTTP/WS surface | **[planned]**, designed in ADR 0003; the engine is a library today |
@@ -67,10 +66,10 @@ This is a private friends server. No real-money entry/exit, no sale of HD, no ad
                              ▼
 ┌─────────────────────────────────────────────────────────────┐
 │ Ledger Backend (swappable, single interface)                │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐   │
-│  │ memory+sqlite│  │  Postgres    │  │     Solana       │   │
-│  │   [built]    │  │  [planned]   │  │ [planned,blocked]│   │
-│  └──────────────┘  └──────────────┘  └──────────────────┘   │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │          memory + sqlite + postgres  —  built          │  │
+│  │         Solana  —  planned, blocked by Custody         │  │
+│  └───────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -146,7 +145,14 @@ Backends receive only the *public* half of a wallet's keypair; they never genera
 - Append-only triggers, `CHECK` constraints, foreign keys (ADR 0006).
 - `verifyIntegrity` checks hashes, ledger rules, balances, replay guards and an optional external checkpoint.
 
-**Postgres backend** [planned, not written]: the same SQL shape as SQLite, using the `pg` package. A `postgres` config value is accepted by the loader and refused at startup.
+**Postgres backend** [built]: the same SQL shape as SQLite, using the `pg` package (an
+optionalDependency, loaded lazily so memory/sqlite-only users never need it installed). Schema-isolated
+per instance — `config.databaseUrl` points at the server, and each backend instance gets its own
+Postgres schema, auto-generated and self-dropping unless a stable name is pinned for a real deployment.
+Runs the identical conformance suite as memory and sqlite. One real difference from sqlite: `node:sqlite`
+is synchronous, so sqlite's append/createWallet get atomicity "for free" from never `await`-ing mid-write;
+`pg` cannot be synchronous, so this backend wraps its own write paths in the engine's `Mutex` class to get
+the same guarantee independent of any caller (see the file's header comment for why that matters).
 
 **Solana backend** [planned, blocked]: HD as an SPL token, server multisig mint authority, server-custodied player keypairs. This would make the engine a custodian of real transferable on-chain assets, which is what `Custody` refuses (`ONCHAIN_CUSTODY_BLOCKED`). Turning it on requires: a backend implementation, an ADR covering key generation / encryption / recovery / blast radius, and explicit human sign-off. It is not a config flag.
 
@@ -207,7 +213,7 @@ The real format is JSON (`heist.config.json`, validated at load; there is no YAM
 }
 ```
 
-Money values are quoted decimal strings, never JSON numbers, and zero prices are rejected. `backend` is `memory` or `sqlite` today; `postgres` and `solana` are accepted names that fail at startup.
+Money values are quoted decimal strings, never JSON numbers, and zero prices are rejected. `backend` is `memory`, `sqlite` or `postgres` today (`postgres` additionally needs `databaseUrl`); `solana` is an accepted name that fails at startup.
 
 ## Why this design works for the company conversations
 
@@ -229,10 +235,9 @@ Money values are quoted decimal strings, never JSON numbers, and zero prices are
 
 ## Build order
 
-1. ✅ Economy Engine + memory and SQLite backends + standalone CLI adapter — the full economy works without any GTA server.
-2. Persistent custody keys, signed ledger rows, adapter authentication + HTTP surface (ADR 0003). Prerequisite for any real adapter.
+1. ✅ Economy Engine + memory, SQLite and Postgres backends + standalone CLI adapter — the full economy works without any GTA server, with a real database option when SQLite stops being enough.
+2. Persistent custody keys, signed ledger rows, adapter authentication + HTTP surface (ADR 0003). Prerequisite for any real adapter. **Needs the project owner's sign-off on ADR 0003's open decisions first — see that ADR's own "Decision needed" section.**
 3. FiveM Lua adapter — connect to a local FiveM dev server, port one interaction (bike rental).
 4. RageMP JS adapter — same interaction, different framework.
-5. Postgres backend, if SQLite stops being enough.
-6. Solana backend behind explicit approval — same intents, real SPL transfers.
-7. Admin dashboard.
+5. Solana backend behind explicit approval — same intents, real SPL transfers.
+6. Admin dashboard.

@@ -59,6 +59,8 @@ export interface HeistConfig {
   admins: string[];
   /** Filesystem path for the sqlite backend. Ignored by other backends. */
   dbPath?: string;
+  /** Connection string for the postgres backend. Ignored by other backends. */
+  databaseUrl?: string;
 }
 
 /** The entity that every economy must have: mint source and fine collector. */
@@ -335,6 +337,20 @@ export function validateConfig(input: unknown, source = '<inline>'): HeistConfig
   }
   if (backend === 'sqlite' && config.dbPath === undefined) {
     throw new InvalidIntent(`config (${source}): backend "sqlite" requires dbPath`);
+  }
+
+  // databaseUrl — same optionality rules as dbPath above.
+  const databaseUrlRaw = input['databaseUrl'];
+  if (databaseUrlRaw !== undefined && databaseUrlRaw !== null) {
+    if (typeof databaseUrlRaw !== 'string' || databaseUrlRaw.trim() === '') {
+      throw new InvalidIntent(
+        `config (${source}): databaseUrl must be a non-empty string when present, got ${describe(databaseUrlRaw)}`,
+      );
+    }
+    config.databaseUrl = databaseUrlRaw;
+  }
+  if (backend === 'postgres' && config.databaseUrl === undefined) {
+    throw new InvalidIntent(`config (${source}): backend "postgres" requires databaseUrl`);
   }
 
   return config;

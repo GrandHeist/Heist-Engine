@@ -6,13 +6,14 @@ import type { HeistConfig } from '../config/config.ts';
 import type { LedgerBackend } from './backend.ts';
 import { MemoryBackend } from './memory.ts';
 import { SqliteBackend } from './sqlite.ts';
+import { PostgresBackend } from './postgres.ts';
 
 /**
  * The backend for `config.backend`. Not yet initialised: the engine's `init()` does that.
  *
- * Only `memory` and `sqlite` exist. `postgres` and `solana` are valid names in config (so
- * the file format does not change when they land) but are refused here with a typed error, never
- * silently downgraded to something that would keep data in the wrong place.
+ * `memory`, `sqlite` and `postgres` exist. `solana` is a valid name in config (so the file format
+ * does not change if it lands) but is refused here with a typed error, never silently downgraded
+ * to something that would keep data in the wrong place.
  */
 export function createBackend(config: HeistConfig): LedgerBackend {
   switch (config.backend) {
@@ -24,10 +25,14 @@ export function createBackend(config: HeistConfig): LedgerBackend {
       }
       return new SqliteBackend(config.dbPath);
     case 'postgres':
+      if (config.databaseUrl === undefined) {
+        throw new EngineError('BACKEND_UNAVAILABLE', 'backend "postgres" needs a databaseUrl');
+      }
+      return new PostgresBackend(config.databaseUrl);
     case 'solana':
       throw new EngineError(
         'BACKEND_UNAVAILABLE',
-        `backend "${config.backend}" is not implemented. Available: memory, sqlite.`,
+        `backend "${config.backend}" is not implemented. Available: memory, sqlite, postgres.`,
       );
   }
 }

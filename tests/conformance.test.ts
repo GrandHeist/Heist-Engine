@@ -10,6 +10,7 @@ import assert from 'node:assert/strict';
 import { EngineError } from '../src/errors.ts';
 import { MemoryBackend } from '../src/ledger/memory.ts';
 import { SqliteBackend } from '../src/ledger/sqlite.ts';
+import { PostgresBackend } from '../src/ledger/postgres.ts';
 import { GENESIS_HASH } from '../src/ledger/hashchain.ts';
 import type { LedgerBackend, WalletKeyInfo } from '../src/ledger/backend.ts';
 import type { Memo, Tx, Wallet } from '../src/types.ts';
@@ -19,11 +20,32 @@ interface BackendFactory {
   create(): LedgerBackend;
 }
 
-const FACTORIES: readonly BackendFactory[] = [
+const FACTORIES: BackendFactory[] = [
   { label: 'MemoryBackend', create: () => new MemoryBackend() },
   // ':memory:' so the suite needs no files and no cleanup.
   { label: 'SqliteBackend', create: () => new SqliteBackend(':memory:') },
 ];
+
+// Real Postgres only, like ADR 0001 says: no mock, no in-memory stand-in claiming to be Postgres.
+// `TEST_DATABASE_URL` defaults to a local instance; no explicit schema, so PostgresBackend makes a
+// fresh one per test and drops it in `close()` — genuine isolation, no cleanup code needed here.
+// If nothing is listening there, this entire backend is skipped (reported, not silently dropped)
+// rather than failing every test in the suite over an environment gap unrelated to the code.
+const PG_URL = process.env['TEST_DATABASE_URL'] ?? 'postgres://localhost/heist_engine_test';
+let pgAvailable = false;
+try {
+  const probe = new PostgresBackend(PG_URL);
+  await probe.init();
+  await probe.close();
+  pgAvailable = true;
+} catch (error) {
+  console.log(
+    `SKIPPING PostgresBackend conformance suite: could not reach ${PG_URL} (${error instanceof Error ? error.message : String(error)})`,
+  );
+}
+if (pgAvailable) {
+  FACTORIES.push({ label: 'PostgresBackend', create: () => new PostgresBackend(PG_URL) });
+}
 
 /** Deterministic stand-in for a Custody-minted public half. */
 function keyFor(seed: string): WalletKeyInfo {
